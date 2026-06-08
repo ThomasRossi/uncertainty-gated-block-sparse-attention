@@ -1,0 +1,20 @@
+# Core ML stack
+torch>=2.3,<2.6
+triton>=2.3
+transformers>=4.45
+accelerate>=0.30
+
+# Datasets — pin v2 because LongBench v1's script-based loader breaks under v3.
+# If you only run RULER and LongBench-v2 you can relax to >=3.
+datasets==2.21.0
+
+# Tokenisation / utilities
+sentencepiece
+protobuf
+
+# Cloud runner (optional — only needed for the Modal-hosted entrypoints in src/modal_app_*.py)
+modal>=0.62
+
+# Plotting / analysis (only if you want to regenerate the figures from results/*.json)
+numpy
+matplotlib

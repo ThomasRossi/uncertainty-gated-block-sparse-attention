@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "Uncertainty-gated selection for block-sparse attention"
+abstract: >-
+  A value-of-information router for block-sparse attention selectors:
+  measures the normalised cutoff margin per query-tile and expands the
+  attended set for the most uncertain tiles. Backbone-agnostic; composes
+  with SSA-style mean pooling and Quest's K-min/K-max upper bound to
+  reach within 2 pp of dense on RULER NIAH-multikey and lift LongBench-v2
+  medium paired recall from 0.40 to 0.75 at fixed budget.
+authors:
+  - family-names: Rossi
+    given-names: Thomas
+type: software
+version: "0.1.0-preview"
+date-released: "2026-06-08"
+license: MIT
+repository-code: "https://github.com/ThomasRossi/uncertainty-gated-block-sparse-attention"
+preferred-citation:
+  type: article
+  title: "Uncertainty-gated selection for block-sparse attention"
+  authors:
+    - family-names: Rossi
+      given-names: Thomas
+  year: 2026
+  url: "[TODO: arXiv URL once assigned]"
