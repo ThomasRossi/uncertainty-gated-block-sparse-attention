@@ -36,7 +36,7 @@
 \section{Introduction}
 %========================================================================
 
-Long-context language models increasingly use \emph{block-sparse attention} as a drop-in replacement for the $O(N^2)$ softmax. The idea is shared by Quest, H2O, SnapKV, MInference, NSA, MoBA, and Subquadratic's SSA: a cheap per-query \emph{selector} picks $k$ out of $\NB$ key blocks; exact attention then runs only on the selected set. The selector is the lever -- it decides where the model attends. Today it is universally implemented as a \emph{single-shot top-$k$ rule} on a pooled inner product $q \cdot \bar k_b$ between the query and a per-block key summary.
+Long-context language models increasingly use \emph{block-sparse attention} as a drop-in replacement for the $O(N^2)$ softmax. The idea is shared by Quest~\citep{tang2024quest}, H2O~\citep{zhang2023h2o}, SnapKV~\citep{li2024snapkv}, MInference~\citep{jiang2024minference}, NSA~\citep{yuan2025nsa}, MoBA~\citep{lu2025moba}, and Subquadratic's SSA~\citep{ssa2025}: a cheap per-query \emph{selector} picks $k$ out of $\NB$ key blocks; exact attention then runs only on the selected set. The selector is the lever -- it decides where the model attends. Today it is universally implemented as a \emph{single-shot top-$k$ rule} on a pooled inner product $q \cdot \bar k_b$ between the query and a per-block key summary.
 
 This is a myopic decision. When the $k$-th and $(k{+}1)$-th block are nearly tied, top-$k$ silently breaks the tie and moves on; if the dropped block contained an evidence token, the answer is gone, and no downstream layer can recover it. The failure mode is structural, not noisy: it bites hardest on \emph{multi-hop} and \emph{query-latent} retrieval, where the relevance of a block depends on what was learned earlier in the same forward pass and is not visible to the selector's surface query--key match. The published SSA numbers themselves show this: NIAH multi-key recall degrades $96 \to 83 \to 68\%$ as the number of keys grows from 2 to 8.
 
@@ -78,18 +78,18 @@ The attention block, for query position $i$ on head $h$, computes
 
 Concrete selectors differ in (a) how they pool keys into a per-block summary and (b) how they score blocks against the query, but \textbf{they all reduce, at the per-query selection step, to a top-$k$ rule over a block score}:
 \begin{itemize}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
-    \item \textbf{SSA} (Subquadratic Sparse Attention) -- per-Q-tile top-$k$ over mean-pooled keys, $s_b = q \cdot \bar k_b$ with $\bar k_b = \frac{1}{B_n}\sum_j k_j$. Cheap to compute; mean-pooling blurs single hot keys, which is exactly the multi-key NIAH degradation discussed above.
-    \item \textbf{Quest} (MLSys '24) -- per-block elementwise $K^{\min}_b, K^{\max}_b$ summaries; score is an upper bound on $\max_{j \in b} q \cdot k_j$, computed coordinate-wise (see Eq.~\ref{eq:quest-score}). Recovers sharp single-key needles that mean-pooling loses.
-    \item \textbf{H2O, SnapKV, MInference} -- top-$k$ over learned or attention-history-based block scores.
-    \item \textbf{NSA, MoBA} -- end-to-end learned gating, but still resolves to a top-$k$ over block scores at the per-query selection step.
+    \item \textbf{SSA}~\citep{ssa2025} (Subquadratic Sparse Attention) -- per-Q-tile top-$k$ over mean-pooled keys, $s_b = q \cdot \bar k_b$ with $\bar k_b = \frac{1}{B_n}\sum_j k_j$. Cheap to compute; mean-pooling blurs single hot keys, which is exactly the multi-key NIAH degradation discussed above.
+    \item \textbf{Quest}~\citep{tang2024quest} -- per-block elementwise $K^{\min}_b, K^{\max}_b$ summaries; score is an upper bound on $\max_{j \in b} q \cdot k_j$, computed coordinate-wise (see Eq.~\ref{eq:quest-score}). Recovers sharp single-key needles that mean-pooling loses.
+    \item \textbf{H2O}~\citep{zhang2023h2o}, \textbf{SnapKV}~\citep{li2024snapkv}, \textbf{MInference}~\citep{jiang2024minference} -- top-$k$ over learned or attention-history-based block scores.
+    \item \textbf{NSA}~\citep{yuan2025nsa}, \textbf{MoBA}~\citep{lu2025moba} -- end-to-end learned gating, but still resolves to a top-$k$ over block scores at the per-query selection step.
 \end{itemize}
 What none of these methods do is treat the cutoff as a \emph{decision under uncertainty}: when $s_{(k-1)} \approx s_{(k)}$, the selector commits without spending extra budget. That step is the lever this paper pulls. Because the lever is on the cutoff (not on how $s$ is computed), it composes with any of the scoring backbones above. In the experiments we evaluate it on top of both the SSA-style K-mean backbone and Quest's K-max upper bound.
 
 \subsection{Long-context evaluation}
 
 The published benchmarks fall into two families.
-\textbf{Synthetic / diagnostic:} RULER (NIAH, VT), BABILong, MRCR. Designed for controlled stress tests of long-context recall. Their failure modes are interpretable but they are \emph{not} predictive of downstream performance, as HELMET has documented.
-\textbf{Real-task:} LongBench (v1, v2), HELMET, NoCha. These cover multi-hop QA, summarisation, code, and so on. LongBench-v2 in particular has a \emph{medium} split with native prompt lengths typically $\geq$100K words, designed to stress long-context selection.
+\textbf{Synthetic / diagnostic:} RULER~\citep{hsieh2024ruler} (NIAH, VT), BABILong, MRCR. Designed for controlled stress tests of long-context recall. Their failure modes are interpretable but they are \emph{not} predictive of downstream performance, as HELMET~\citep{yen2024helmet} has documented.
+\textbf{Real-task:} LongBench~\citep{bai2023longbench, bai2024longbench}, HELMET~\citep{yen2024helmet}, NoCha. These cover multi-hop QA, summarisation, code, and so on. LongBench-v2 in particular has a \emph{medium} split with native prompt lengths typically $\geq$100K words, designed to stress long-context selection.
 We use \textbf{PCH} (diagnostic, ours), \textbf{RULER NIAH} (synthetic, standardised), and \textbf{LongBench-v1 + v2 medium} (real-task, standardised).
 
 %========================================================================
@@ -107,7 +107,7 @@ s^{(L)}[i,h,b] \;=\; \frac{q_i^{(L,h)}\cdot \bar k_b^{(L,h)}}{\sqrt{\dhead}},\qq
 \end{equation}
 This is the standard pooled-key score used throughout the literature. The information-theoretic content of $s$ is bounded by the rank of the pooled-key matrix; we found this in practice via a spectral diagnostic (effective rank $\approx 60\text{--}80$ at $95\%$ energy in mid-layers), which informs how aggressively the score itself can be compressed but does not change its top-$k$ structure.
 
-\paragraph{Backbone choice.} The block-scoring rule above is one of several. Quest replaces $\bar k_b$ with an elementwise min/max pair $(K^{\min}_b, K^{\max}_b)$ and scores
+\paragraph{Backbone choice.} The block-scoring rule above is one of several. Quest~\citep{tang2024quest} replaces $\bar k_b$ with an elementwise min/max pair $(K^{\min}_b, K^{\max}_b)$ and scores
 \begin{equation}\label{eq:quest-score}
 s^{\text{quest}}_{b} \;=\; \sum_{d=1}^{\dhead}\, \max\!\bigl(q_d \cdot K^{\max}_{b,d},\; q_d \cdot K^{\min}_{b,d}\bigr),
 \end{equation}
@@ -187,7 +187,7 @@ The kernel skips $b=\NB$ on a fast check, so non-triggered tiles cost the same a
 
 \textbf{Model.} Qwen2.5-14B-Instruct, weights frozen (no retraining, no fine-tuning). \textbf{Hardware.} A100-80GB via Modal. \textbf{Sparse path.} Custom Triton block-sparse attention kernel with fused per-tile selection. \textbf{Baselines and policies.}
 \begin{itemize}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
-    \item \emph{dense} -- FlashAttention SDPA, the ceiling.
+    \item \emph{dense} -- FlashAttention~\citep{dao2022flashattention} via PyTorch SDPA, the ceiling.
     \item \emph{top-$k$} -- per-tile top-$k$ on the K-mean backbone (Eq.~\ref{eq:block-score}). SSA-style baseline; uses only Step~2.
     \item \emph{Quest} -- per-tile top-$k$ on the Quest K-max upper-bound backbone (Eq.~\ref{eq:quest-score}). Strong baseline on sharp-needle tasks.
     \item \emph{router} -- Steps 2--6 on top of the K-mean backbone, $q = 0.40, \rho = 2$. Uncertainty-gated expansion only.
@@ -532,7 +532,83 @@ The bound \eqref{eq:bai-suboptimality} is asymptotic; we cannot directly read $C
 \textbf{Owed.} The composite attention-output bound; an explicit constant for the noise models that fit our actual block scores (empirical fit of $\tau$, possibly per-layer); and a treatment of the LB-v2 medium gap that distinguishes ``the bound is loose here'' from ``the budget is binding here.''
 
 \bibliographystyle{plainnat}
-\begin{thebibliography}{9}
+\begin{thebibliography}{99}
+
+% --- Block-sparse / efficient long-context selectors
+\bibitem[Tang et al.(2024)]{tang2024quest}
+J.~Tang, Y.~Zhao, K.~Zhu, G.~Xiao, B.~Kasikci, and S.~Han.
+\newblock Quest: Query-aware sparsity for efficient long-context {LLM} inference.
+\newblock In \emph{MLSys}, 2024.
+\newblock \url{https://arxiv.org/abs/2406.10774}.
+
+\bibitem[Zhang et al.(2023)]{zhang2023h2o}
+Z.~Zhang, Y.~Sheng, T.~Zhou, T.~Chen, L.~Zheng, R.~Cai, Z.~Song, Y.~Tian, C.~R\'e, C.~Barrett, Z.~Wang, and B.~Chen.
+\newblock {H2O}: Heavy-hitter oracle for efficient generative inference of large language models.
+\newblock In \emph{NeurIPS}, 2023.
+\newblock \url{https://arxiv.org/abs/2306.14048}.
+
+\bibitem[Li et al.(2024)]{li2024snapkv}
+Y.~Li, Y.~Huang, B.~Yang, B.~Venkitesh, A.~Locatelli, H.~Ye, T.~Cai, P.~Lewis, and D.~Chen.
+\newblock {SnapKV}: {LLM} knows what you are looking for before generation.
+\newblock In \emph{NeurIPS}, 2024.
+\newblock \url{https://arxiv.org/abs/2404.14469}.
+
+\bibitem[Jiang et al.(2024)]{jiang2024minference}
+H.~Jiang, Y.~Li, C.~Zhang, Q.~Wu, X.~Luo, S.~Ahn, Z.~Han, A.~H. Abdi, D.~Li, C.-Y. Lin, Y.~Yang, and L.~Qiu.
+\newblock {MInference 1.0}: Accelerating pre-filling for long-context {LLMs} via dynamic sparse attention.
+\newblock In \emph{NeurIPS}, 2024.
+\newblock \url{https://arxiv.org/abs/2407.02490}.
+
+\bibitem[Yuan et al.(2025)]{yuan2025nsa}
+J.~Yuan, H.~Gao, D.~Dai, J.~Luo, L.~Zhao, Z.~Zhang, Z.~Xie, Y.~X. Wei, L.~Wang, Z.~Xiao, et~al.
+\newblock Native sparse attention: Hardware-aligned and natively trainable sparse attention.
+\newblock arXiv preprint, 2025.
+\newblock \url{https://arxiv.org/abs/2502.11089}.
+
+\bibitem[Lu et al.(2025)]{lu2025moba}
+E.~Lu, Z.~Jiang, J.~Liu, Y.~Du, T.~Jiang, C.~Hong, S.~Liu, W.~He, E.~Yuan, Y.~Wang, et~al.
+\newblock {MoBA}: Mixture of block attention for long-context {LLMs}.
+\newblock arXiv preprint, 2025.
+\newblock \url{https://arxiv.org/abs/2502.13189}.
+
+\bibitem[Subquadratic(2025)]{ssa2025}
+Subquadratic.
+\newblock How {SSA} makes long-context practical.
+\newblock 2025.
+\newblock \url{https://subq.ai/how-ssa-makes-long-context-practical}.
+
+\bibitem[Dao et al.(2022)]{dao2022flashattention}
+T.~Dao, D.~Y. Fu, S.~Ermon, A.~Rudra, and C.~R\'e.
+\newblock {FlashAttention}: Fast and memory-efficient exact attention with {IO}-awareness.
+\newblock In \emph{NeurIPS}, 2022.
+\newblock \url{https://arxiv.org/abs/2205.14135}.
+
+% --- Long-context benchmarks
+\bibitem[Hsieh et al.(2024)]{hsieh2024ruler}
+C.-P. Hsieh, S.~Sun, S.~Kriman, S.~Acharya, D.~Rekesh, F.~Jia, Y.~Zhang, and B.~Ginsburg.
+\newblock {RULER}: What's the real context size of your long-context language models?
+\newblock In \emph{COLM}, 2024.
+\newblock \url{https://arxiv.org/abs/2404.06654}.
+
+\bibitem[Bai et al.(2023)]{bai2023longbench}
+Y.~Bai, X.~Lv, J.~Zhang, H.~Lyu, J.~Tang, Z.~Huang, Z.~Du, X.~Liu, A.~Zeng, L.~Hou, Y.~Dong, J.~Tang, and J.~Li.
+\newblock {LongBench}: A bilingual, multitask benchmark for long context understanding.
+\newblock In \emph{ACL}, 2024.
+\newblock \url{https://arxiv.org/abs/2308.14508}.
+
+\bibitem[Bai et al.(2024)]{bai2024longbench}
+Y.~Bai, S.~Tu, J.~Zhang, H.~Peng, X.~Wang, X.~Lv, S.~Cao, J.~Xu, L.~Hou, Y.~Dong, J.~Tang, and J.~Li.
+\newblock {LongBench v2}: Towards deeper understanding and reasoning on realistic long-context multitasks.
+\newblock arXiv preprint, 2024.
+\newblock \url{https://arxiv.org/abs/2412.15204}.
+
+\bibitem[Yen et al.(2024)]{yen2024helmet}
+H.~Yen, T.~Gao, M.~Hou, K.~Ding, D.~Fleischer, P.~Izsak, M.~Wasserblat, and D.~Chen.
+\newblock {HELMET}: How to evaluate long-context language models effectively and thoroughly.
+\newblock arXiv preprint, 2024.
+\newblock \url{https://arxiv.org/abs/2410.02694}.
+
+% --- Best-arm identification (formal anchor for $\sigma$, Appendix C)
 \bibitem[Garivier and Kaufmann(2016)]{garivier2016optimal}
 A.~Garivier and E.~Kaufmann.
 \newblock Optimal best arm identification with fixed confidence.
@@ -542,6 +618,7 @@ A.~Garivier and E.~Kaufmann.
 E.~Kaufmann, O.~Capp\'e, and A.~Garivier.
 \newblock On the complexity of best-arm identification in multi-armed bandit models.
 \newblock \emph{JMLR}, 17(1):1--42, 2016.
+
 \end{thebibliography}
 
 \end{document}
