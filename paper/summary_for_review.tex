@@ -22,7 +22,7 @@
 
 \title{Uncertainty-gated selection for block-sparse attention\thanks{\small Code, data, and reproduction scripts: \url{https://github.com/ThomasRossi/uncertainty-gated-block-sparse-attention}}\\[0.3em]
 \large A value-of-information view of the SSA-style selector}
-\author{Thomas Rossi \\ \texttt{t.rossi@eonpass.com}}
+\author{Thomas Rossi \\ Eonpass \\ \texttt{t.rossi@eonpass.com}}
 \date{\today}
 
 \begin{document}
@@ -385,6 +385,12 @@ The fused selection-plus-kernel pipeline carries the speed story: $0.97\times$ d
 
 Open work, in priority order: (i) push LB-v2 medium to $n=300$ to bring the router-on-Quest composition lift to statistical scale; (ii) add HELMET-RAG as a third standardised benchmark; (iii) profile at 128K to confirm the predicted $\approx 2.5\times$ speed crossover; (iv) sweep the router expansion factor $\rho \in \{1.25, 1.5, 2\}$ for a paired/speed Pareto.
 }
+
+%========================================================================
+\section*{Acknowledgements}
+%========================================================================
+
+The author thanks Claude Opus 4.7 (Anthropic) for substantial assistance with drafting, structural revision, and the development of the best-arm-identification framing in Appendix~\ref{app:bai}. All experiments, code, and final claims remain the author's responsibility.
 
 %========================================================================
 \appendix
