@@ -315,6 +315,30 @@ Quest                    & K-max   & 0.21 & 0.60 & 20 \\
 
 \textbf{Read.} LB-v1 native context $\leq 30$K and budget $=33$ blocks $\approx 2$K attended tokens per row $-$ the budget is generous relative to the typical needle density of these tasks. \textbf{The router's lift activates only when the per-query budget is small relative to where the answer-relevant evidence lives.} The combined LB-v1 / LB-v2 result is the cleanest framing of when our method matters: it is not a free win on every long-context task, it is a targeted win on the regime where the selector itself is the bottleneck. LB-v2 medium puts the budget under pressure (100K source $\to$ 32K window); LB-v1 does not.
 
+\paragraph{Decomposing the router's lift: budget vs.\ selectivity.} The router's $+5$\,pp paired-recall lift over Quest on RULER NIAH (Section~\ref{sec:ruler}) admits a confound. At $q=0.40$ and $\rho=2$, the router spends on average $\approx 1.4\times$ Quest's budget ($92.4$ effective blocks per tile, vs.\ $66$ for Quest at $\kbudget=33$). Some of the lift could come not from spending the marginal budget \emph{selectively} -- the router's design intent -- but simply from spending \emph{more} budget on average. To separate the two contributions we ran uniform Quest at a budget-matched control ($\kbudget=47$, effective $94$) and a sweep of intermediate budgets on the same $n=100$ RULER NIAH-multikey examples (Table~\ref{tab:budget-match}).
+
+\begin{table}[h]
+\centering\small
+\caption{Budget-match ablation, RULER NIAH-multikey at $n=100$, ctx=32K. Effective budget includes the sink and self-block forced into every $\text{kv\_idx}$; for the router it is the mean over tiles. $\text{Quest}_{\kbudget=47}$ is the budget-matched control for the router at $q=0.40$.}\label{tab:budget-match}
+\begin{tabular}{llrr}
+\toprule
+policy & backbone & eff.\ budget & paired \\
+\midrule
+top-$k$                              & K-mean & 66    & 0.510 \\
+Quest $\kbudget=33$                  & K-max  & 66    & 0.930 \\
+Quest $\kbudget=40$                  & K-max  & 80    & 0.950 \\
+\textbf{Quest $\kbudget=47$} (matched) & K-max  & \textbf{94}   & \textbf{0.960} \\
+Quest $\kbudget=52$                  & K-max  & 104   & 0.970 \\
+Quest $\kbudget=66$                  & K-max  & 132   & 0.970 \\
+\textbf{router-on-Quest} ($q=0.40$)  & K-max  & \textbf{92.4} & \textbf{0.980} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Decomposition.} Of the $+5$\,pp router-vs-Quest-at-$\kbudget{=}33$ lift: $\approx +3$\,pp comes from uniform budget expansion ($\text{Quest}_{\kbudget=47}$ minus $\text{Quest}_{\kbudget=33}$ $= 0.96 - 0.93$), $\approx +2$\,pp from selectivity (router minus $\text{Quest}_{\kbudget=47}$ $= 0.98 - 0.96$). Uniform Quest plateaus at $0.97$ from $\kbudget=52$ onward; the router lands $1$\,pp above that asymptote, suggesting selectivity buys something genuinely orthogonal to raw budget. \textbf{The RULER NIAH headline is therefore roughly $2/3$ budget, $1/3$ selectivity} -- not a re-write of the result, but a sharper attribution of where the lift comes from.
+
+\textbf{Statistical caveat: NIAH at 32K is near-ceiling.} Dense paired is $1.00$ ($100/100$), $\text{Quest}_{\kbudget=33}$ already preserves $93/100$ examples, and the entire ablation lives in $[0.93, 0.98]$ -- at most $7$ examples of paired headroom. McNemar's exact test on router vs $\text{Quest}_{\kbudget=47}$ gives $3$ discordant pairs router-favoring and $1$ Quest-favoring, $p = 0.625$: directionally consistent with the selectivity contribution but not enough headroom to separate methods clustered this close to dense. The cleanest follow-up is the same sweep on LongBench-v2 medium, where $\text{Quest}_{\kbudget=33}$ paired sits at $0.60$ ($\approx 6\times$ the headroom of NIAH at this saturation) and the budget vs.\ selectivity split should resolve cleanly.
+
 \subsection{Efficiency: 32K and 64K prefill profile}\label{sec:efficiency}
 
 \textbf{Setup.} CUDA-event breakdown of one prefill forward (no decode) at $n=8$. Decode ($Q=1$) goes through SDPA dense for every policy, so policy-dependent wall time comes purely from prefill.
