@@ -58,6 +58,7 @@ JSON dumps for the experiments quoted in the paper:
 - `longbench_v2_20260607_132056.json` — LongBench-v2 medium, dense / top-$k$ / router (K-mean), $n=100$, 32K
 - `longbench_v2_20260607_184826.json` — LongBench-v2 medium, Quest baseline added, $n=100$, 32K
 - `longbench_v2_20260607_222750.json` — LongBench-v2 medium, router-on-Quest, $n=100$, 32K
+- `ruler_smoke_20260609_204524.json` — **Budget-match ablation** (Table 4 in the paper): RULER NIAH-multikey, Quest swept at $k_{\text{budget}} \in \{33, 40, 47, 52, 66\}$ + router-on-Quest baseline, $n=100$, 32K. Used to decompose the router's $+5$ pp lift over Quest into $\approx+3$ pp from average budget vs $\approx+2$ pp from selectivity.
 - `profile_20260601_204936.json`, `profile_20260601_211844.json` — 32K and 64K prefill CUDA-event profiles ($n=8$)
 
 The JSON layout is one record per (task, policy, example): see `poc_core.py` for the schema.
@@ -77,15 +78,33 @@ The JSON layout is one record per (task, policy, example): see `poc_core.py` for
 The experiments were run on Modal. To reproduce locally, replace the `@app.function` decorators in `modal_app_*.py` with plain function definitions and point the entry script at a local GPU.
 
 ```bash
-# RULER NIAH-multikey, n=100, 32K, all four sparse policies
+# RULER NIAH-multikey, n=100, 32K, all four sparse policies (Table 2)
 python -m modal_app_ruler --ctxlen 32768 --n-per 50 --policies dense topk quest router
 
-# LongBench-v2 medium, n=100, 32K, all four sparse policies
+# LongBench-v2 medium, n=100, 32K, all four sparse policies (Table 3)
 python -m modal_app_longbench_v2 --ctxlen 32768 --n 100 --policies dense topk quest router
 
-# 64K prefill profile
+# 64K prefill profile (Table referenced in §4.6 Efficiency)
 python -m modal_app_profile --ctxlen 65536 --n 8
+
+# Budget-match ablation (Table 4): re-runs Quest at several budgets to
+# decompose the router's lift into "more average budget" vs "selectivity".
+# Both modal_app_ruler.py and modal_app_longbench_v2.py accept the
+# --budget-values / --budget-sweep-policy flags below; the dense / topk /
+# quest / router rows in the base panel are reused from cache, so the
+# extra Quest sweeps are the only cold runs.
+python -m modal_app_ruler --ctxlen 32768 --n-per 50 \
+    --policies dense topk quest router \
+    --budget-sweep-policy quest \
+    --budget-values 40,47,52,66
 ```
+
+The ablation harness adds an audit table at the end of each run, derived
+from `policy` labels and `matched_budget` via the `_policy_eff_budget`
+helper -- no mutation of the cache-keyed result records, so prior cached
+panels validate without re-running. To run the same ablation on a
+different model, add `--model Qwen/Qwen2.5-7B-Instruct-1M` (or any
+HF-hosted Qwen-family or compatible LLM).
 
 Outputs land in `results/` as `<task>_<timestamp>.json`. The same `poc_core.summary_table` / `paired_table` printers reproduce the tables in the paper.
 

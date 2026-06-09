@@ -36,6 +36,38 @@ cache = modal.Volume.from_name("voi-router-hf-cache", create_if_missing=True)
 app = modal.App("voi-router-ruler")
 
 
+def _policy_eff_budget(policy: str, matched_budget: int):
+    """Derive mean real blocks/tile from policy label + matched_budget.
+
+    v2 selection always doubles budget_blocks -> k_bud_base = 2*b. For router
+    modes, k_bud_max = 2*k_bud_base; expected blocks/tile = 2*b * (1+q) where
+    q is the quantile (trigger fraction == quantile by construction, up to
+    discretisation). Returns None for dense (full context)."""
+    if policy == "dense":
+        return None
+    if policy.startswith("router_q"):
+        # label is e.g. "router_q0.4" or "router_q0.4_quest"
+        rest = policy[len("router_q"):].split("_", 1)[0]
+        try:
+            q = float(rest)
+        except ValueError:
+            q = 0.0
+        return 2 * matched_budget * (1 + q)
+    if policy.startswith("router_tau"):
+        # tau-mode router: we don't know empirical trigger here -- report
+        # the kernel slot cap (upper bound).
+        return 4 * matched_budget
+    # quest_b46, quest_b40, etc. -- explicit budget override.
+    if "_b" in policy:
+        try:
+            b = int(policy.rsplit("_b", 1)[1])
+            return 2 * b
+        except ValueError:
+            pass
+    # topk, quest, belief, etc. at the matched budget.
+    return 2 * matched_budget
+
+
 @app.function(image=image, gpu="A100-80GB", volumes={"/cache": cache},
               timeout=14400)
 def experiment(n_per: int, ctx: int, buckets: list,
@@ -43,7 +75,9 @@ def experiment(n_per: int, ctx: int, buckets: list,
                router_mode: str, router_grain: str, router_values: list,
                router_score: str,
                seed: int, kernel_v2: bool,
-               code_version: str, dense_code_version: str):
+               code_version: str, dense_code_version: str,
+               budget_values: list, budget_sweep_policy: str,
+               model_name: str = MODEL):
     import random
 
     import torch
@@ -61,9 +95,10 @@ def experiment(n_per: int, ctx: int, buckets: list,
           f"router={router_mode}/{router_grain} vals={router_values} "
           f"code_version={code_version}", flush=True)
 
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    print(f"loading model: {model_name}", flush=True)
+    tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL, dtype=torch.bfloat16, attn_implementation="block_sparse"
+        model_name, dtype=torch.bfloat16, attn_implementation="block_sparse"
     ).to("cuda").eval()
     cache.commit()
     sparse_attention.install_rollout_hooks(model)
@@ -85,7 +120,7 @@ def experiment(n_per: int, ctx: int, buckets: list,
             sparse_attention.SEL.router_tau = router_values[0]
     result = poc_core.run_sweep(model, tok, examples, "cuda",
                                 policies=tuple(base_pols), fixed_budget=fb,
-                                cache=result_cache, model_name=MODEL,
+                                cache=result_cache, model_name=model_name,
                                 code_version=code_version,
                                 dense_code_version=dense_code_version)
     if "router" in policies and router_values:
@@ -103,13 +138,33 @@ def experiment(n_per: int, ctx: int, buckets: list,
             print(f"\n=== router[{router_mode}] {label_knob} ===", flush=True)
             for i, (task, kw, ex) in enumerate(examples):
                 r = poc_core.run_one(model, tok, ex, "router", "cuda",
-                                     cache=result_cache, model_name=MODEL,
+                                     cache=result_cache, model_name=model_name,
                                      code_version=code_version,
                                      dense_code_version=dense_code_version)
                 row = dict(task=task, diff=str(kw),
                            policy=f"router_{label_knob}", **r)
                 result["rows"].append(row)
                 print(f"[router {label_knob} {i+1}/{len(examples)}] "
+                      f"{task} {kw} recall={r['recall']:.2f} "
+                      f"hit={r['hit']:.2f} {r['dt']:.1f}s", flush=True)
+        result_cache.save()
+        cache.commit()
+    # Budget ablation sweep: re-run `budget_sweep_policy` at each budget value
+    # so router-at-base vs uniform-at-matched-budget is one JSON away.
+    if budget_values and budget_sweep_policy:
+        for b in budget_values:
+            sparse_attention.SEL.budget_blocks = int(b)
+            label = f"{budget_sweep_policy}_b{b}"
+            print(f"\n=== budget sweep: {label} ===", flush=True)
+            for i, (task, kw, ex) in enumerate(examples):
+                r = poc_core.run_one(model, tok, ex, budget_sweep_policy,
+                                     "cuda",
+                                     cache=result_cache, model_name=model_name,
+                                     code_version=code_version,
+                                     dense_code_version=dense_code_version)
+                row = dict(task=task, diff=str(kw), policy=label, **r)
+                result["rows"].append(row)
+                print(f"[{label} {i+1}/{len(examples)}] "
                       f"{task} {kw} recall={r['recall']:.2f} "
                       f"hit={r['hit']:.2f} {r['dt']:.1f}s", flush=True)
         result_cache.save()
@@ -122,6 +177,8 @@ def experiment(n_per: int, ctx: int, buckets: list,
     result["policies"] = list(policies)
     result["router_mode"] = router_mode
     result["router_values"] = list(router_values)
+    result["budget_values"] = list(budget_values)
+    result["budget_sweep_policy"] = budget_sweep_policy
     result["code_version"] = code_version
     return result
 
@@ -137,8 +194,11 @@ def main(n_per: int = 2, ctxlen: int = 32768,
          router_grain: str = "row",
          router_values: str = "0.20",
          router_score: str = "mean",
+         budget_values: str = "",
+         budget_sweep_policy: str = "quest",
          seed: int = 0,
-         kernel_v2: bool = True):
+         kernel_v2: bool = True,
+         model: str = MODEL):
     # RULER smoke: two tasks at the same ctx -- NIAH (single-hop budget
     # contention) and VT (multi-hop chain tracing).
     buckets = [
@@ -148,6 +208,7 @@ def main(n_per: int = 2, ctxlen: int = 32768,
     ]
     pols = [p.strip() for p in policies.split(",")]
     val_list = [float(v.strip()) for v in router_values.split(",") if v.strip()]
+    bud_list = [int(v.strip()) for v in budget_values.split(",") if v.strip()]
 
     from result_cache import hash_files
     prompt_files = ["poc_core.py", "ruler_tasks.py", "pointer_haystack.py"]
@@ -159,7 +220,8 @@ def main(n_per: int = 2, ctxlen: int = 32768,
                                router_mode, router_grain, val_list,
                                router_score,
                                seed, kernel_v2,
-                               code_version, dense_code_version)
+                               code_version, dense_code_version,
+                               bud_list, budget_sweep_policy, model)
 
     import poc_core
     print("\n" + poc_core.summary_table(buckets, result["rows"]))
@@ -196,6 +258,43 @@ def main(n_per: int = 2, ctxlen: int = 32768,
                              for i in dc_idx) / len(dc_idx)
                 line += f"  paired={r_kept:.2f}"
             print(line)
+
+    # Budget-sweep panel: uniform `budget_sweep_policy` at varied budgets.
+    # poc_core's tables drop unknown policy labels; this prints them.
+    if bud_list:
+        n = len(drows)
+        dc_idx_b = [i for i, r in enumerate(drows) if r["recall"] >= 1.0]
+        print(f"\nbudget sweep ({budget_sweep_policy} at varied budgets):")
+        for b in bud_list:
+            label = f"{budget_sweep_policy}_b{b}"
+            brows = [r for r in result["rows"] if r["policy"] == label]
+            if not brows:
+                continue
+            rec = sum(r["recall"] for r in brows) / len(brows)
+            hit = sum(r["hit"] for r in brows) / len(brows)
+            dt = sum(r["dt"] for r in brows) / len(brows)
+            line = (f"  b={b:>3}: recall={rec:.3f}  hit={hit:.3f}  "
+                    f"mean_dt={dt:.2f}s  n={len(brows)}")
+            if dc_idx_b and len(brows) == n:
+                kept = sum(brows[i]["recall"] >= 1.0
+                           for i in dc_idx_b) / len(dc_idx_b)
+                line += f"  paired={kept:.2f}"
+            print(line)
+
+    # Effective-budget audit: derive blocks/tile per policy from policy label
+    # + matched_budget. v2 selection (sparse_attention.py:688) always doubles
+    # budget_blocks; router adds quantile-fraction expansion on top.
+    print(f"\nEFFECTIVE BUDGET per policy "
+          f"(matched_budget={result['matched_budget']}, kernel_v2 always 2x):")
+    pol_seen = []
+    for r in result["rows"]:
+        if r["policy"] not in pol_seen:
+            pol_seen.append(r["policy"])
+    for p in pol_seen:
+        n = sum(1 for r in result["rows"] if r["policy"] == p)
+        eff = _policy_eff_budget(p, result["matched_budget"])
+        eff_s = "full ctx" if eff is None else f"{eff:.1f}"
+        print(f"  {p:<24} eff_budget={eff_s:>9}  n={n}")
 
     import os
     os.makedirs("results", exist_ok=True)
