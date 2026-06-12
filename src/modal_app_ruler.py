@@ -26,7 +26,8 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch", "transformers==5.9.0", "accelerate",
                  "safetensors", "hf_transfer")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache"})
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     .add_local_python_source("sparse_attention", "ruler_tasks", "poc_core",
                              "pointer_haystack", "result_cache",
                              "triton_block_attn")

@@ -31,7 +31,8 @@ image = (
                  "safetensors", "hf_transfer",
                  "datasets==2.21.0")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache",
-          "HF_DATASETS_CACHE": "/cache/datasets_v221"})
+          "HF_DATASETS_CACHE": "/cache/datasets_v221",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     .add_local_python_source("sparse_attention", "ruler_tasks", "poc_core",
                              "pointer_haystack", "result_cache",
                              "triton_block_attn", "longbench_tasks")

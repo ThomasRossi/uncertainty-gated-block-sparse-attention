@@ -27,7 +27,8 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch", "transformers==5.9.0", "accelerate",
                  "safetensors", "hf_transfer")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache"})
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     .add_local_python_source("sparse_attention", "ruler_tasks", "poc_core",
                              "pointer_haystack", "result_cache",
                              "triton_block_attn")
@@ -40,7 +41,7 @@ app = modal.App("voi-router-profile")
 @app.function(image=image, gpu="A100-80GB", volumes={"/cache": cache},
               timeout=3600)
 def profile(n_per: int, ctx: int, buckets: list, fixed_budget: int,
-            router_quantile: float, seed: int):
+            router_quantile: float, seed: int, model_name: str = MODEL):
     import random
 
     import torch
@@ -56,9 +57,9 @@ def profile(n_per: int, ctx: int, buckets: list, fixed_budget: int,
     print(f"{len(examples)} examples, ctx~{ctx}, fixed_budget={fixed_budget}",
           flush=True)
 
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL, dtype=torch.bfloat16, attn_implementation="block_sparse"
+        model_name, dtype=torch.bfloat16, attn_implementation="block_sparse"
     ).to("cuda").eval()
     print(f"model loaded, gpu={torch.cuda.get_device_name(0)}", flush=True)
 
@@ -134,14 +135,14 @@ def profile(n_per: int, ctx: int, buckets: list, fixed_budget: int,
 def main(n_per: int = 4, ctxlen: int = 32768, fixed_budget: int = 33,
          router_quantile: float = 0.40, seed: int = 0,
          num_keys: int = 4, num_hops: int = 3,
-         num_distractor_chains: int = 3):
+         num_distractor_chains: int = 3, model: str = MODEL):
     buckets = [
         ("niah_multikey", {"num_keys": num_keys}),
         ("vt", {"num_hops": num_hops,
                 "num_distractor_chains": num_distractor_chains}),
     ]
     results = profile.remote(n_per, ctxlen, buckets, fixed_budget,
-                             router_quantile, seed)
+                             router_quantile, seed, model)
 
     # Print a clean per-policy summary.
     print("\n" + "=" * 64)
