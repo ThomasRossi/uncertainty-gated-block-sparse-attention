@@ -12,15 +12,28 @@ authors:
   - family-names: Rossi
     given-names: Thomas
 type: software
-version: "0.1.0-preview"
-date-released: "2026-06-08"
+version: "0.2.0"
+date-released: "2026-06-12"
 license: MIT
 repository-code: "https://github.com/ThomasRossi/uncertainty-gated-block-sparse-attention"
+identifiers:
+  - description: "Concept DOI (always resolves to the latest version)"
+    type: doi
+    value: 10.5281/zenodo.20630587
+  - description: "Version 2 (current)"
+    type: doi
+    value: 10.5281/zenodo.20663967
+  - description: "Version 1 (original priority timestamp, 2026-06-10)"
+    type: doi
+    value: 10.5281/zenodo.20630588
 preferred-citation:
-  type: article
+  type: generic
   title: "Uncertainty-gated selection for block-sparse attention"
   authors:
     - family-names: Rossi
       given-names: Thomas
   year: 2026
-  url: "[TODO: arXiv URL once assigned]"
+  publisher:
+    name: Zenodo
+  doi: 10.5281/zenodo.20630587
+  url: "https://doi.org/10.5281/zenodo.20630587"

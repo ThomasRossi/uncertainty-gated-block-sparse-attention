@@ -110,7 +110,26 @@ Outputs land in `results/` as `<task>_<timestamp>.json`. The same `poc_core.summ
 
 ## Citing
 
-\TODO{Add a BibTeX block once the arXiv ID is assigned.} See `CITATION.cff` for the machine-readable form.
+The paper is archived on Zenodo with a persistent DOI:
+
+- **Concept DOI** (always resolves to the latest version): [`10.5281/zenodo.20630587`](https://doi.org/10.5281/zenodo.20630587)
+- v2 (current): [`10.5281/zenodo.20663967`](https://doi.org/10.5281/zenodo.20663967)
+- v1: [`10.5281/zenodo.20630588`](https://doi.org/10.5281/zenodo.20630588)
+
+BibTeX (cite the concept DOI for "always latest"; swap in a version DOI to pin):
+
+```bibtex
+@misc{rossi2026voirouter,
+  author    = {Rossi, Thomas},
+  title     = {Uncertainty-gated selection for block-sparse attention},
+  year      = {2026},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.20630587},
+  url       = {https://doi.org/10.5281/zenodo.20630587}
+}
+```
+
+See `CITATION.cff` for the machine-readable form.
 
 ## License
 
