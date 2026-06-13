@@ -93,7 +93,8 @@ def experiment(length: str, difficulty: str, n_per: int, ctx: int,
           f"difficulty={difficulty}", flush=True)
 
     print(f"loading model: {model_name}", flush=True)
-    tok = AutoTokenizer.from_pretrained(model_name)
+    tok_kwargs = {"fix_mistral_regex": True} if "mistral" in model_name.lower() else {}
+    tok = AutoTokenizer.from_pretrained(model_name, **tok_kwargs)
     model = AutoModelForCausalLM.from_pretrained(
         model_name, dtype=torch.bfloat16, attn_implementation="block_sparse"
     ).to("cuda").eval()

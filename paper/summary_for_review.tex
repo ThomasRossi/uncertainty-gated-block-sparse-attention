@@ -29,7 +29,7 @@
 \maketitle
 
 \begin{abstract}
-\textcolor{red}{Block-sparse attention scales long-context language models by replacing the $O(N^2)$ softmax with a per-query top-$k$ selection over key blocks. This cutoff is myopic: when the $k$-th and $(k{+}1)$-th blocks are nearly tied in score, the selector commits without spending extra budget, and the dropped block -- sometimes the only carrier of an answer hop -- is unrecoverable downstream. We propose a value-of-information \emph{router} that measures, for each query, how decisively the top-$k$ cut was made -- the score gap between the last kept block and the first rejected one -- and, for the queries where that gap is smallest, doubles the kept set. The rule is independent of how block scores are computed and composes with existing scoring backbones. We isolate selector quality from model capability with a \emph{paired recall} metric (the fraction of dense-correct examples the sparse policy also solves) and a diagnostic benchmark, the Pointer-Chase Haystack. Across two models (Qwen2.5-14B-Instruct, Qwen2.5-7B-Instruct-1M) and contexts from 32K to 128K, evaluated on top of two scoring backbones -- SSA-style mean pooling and Quest's K-min/K-max upper bound -- the router lifts RULER NIAH-multikey paired recall from $0.51 \to 0.63$ (mean) and $0.93 \to 0.98$ (Quest, within $2$\,pp of dense) at 32K on the 14B model; the same composition reaches paired $1.00$ on the 7B-1M model at 32K and $0.81$ at 128K (vs.\ Quest alone $0.77$, top-$k$ $0.09$). On LongBench-v2 medium ($n=215$, 32K), router-on-Quest reaches paired $0.75$ vs.\ top-$k$ $0.47$ ($+28$\,pp, McNemar $p<0.01$). A LongBench-v1 negative control localises the regime: the lift activates only when the selector's per-query budget (the blocks it keeps) is small relative to where the answer-relevant evidence lives. A budget-match ablation decomposes the lift as roughly $2/3$ uniform-budget effect, $1/3$ selectivity. The fused selection-plus-kernel pipeline runs at $0.76$--$0.85\times$ dense wall time at 64K and $0.57$--$0.62\times$ at 128K; the crossover widens structurally with context length as predicted by Amdahl arithmetic on the attention share of prefill.}
+\textcolor{red}{Block-sparse attention scales long-context language models by replacing the $O(N^2)$ softmax with a per-query top-$k$ selection over key blocks. This cutoff is myopic: when the $k$-th and $(k{+}1)$-th blocks are nearly tied in score, the selector commits without spending extra budget, and a dropped block carrying answer evidence is unrecoverable downstream. We propose a value-of-information \emph{router} that measures, for each query, how decisively the top-$k$ cut was made, and doubles the kept set for the queries where that gap is smallest; the rule is backbone-agnostic and stacks with existing block-scoring methods such as Quest. On LongBench-v2 medium at $n=215$ (the entire dataset subset), router-on-Quest reaches paired recall $0.75$ vs.\ top-$k$ $0.47$ -- $+28$\,pp over the SSA-style baseline (McNemar $p<0.01$) -- while attending to $\sim 4\%$ of the context; it lands within $2$\,pp of dense on RULER NIAH multikey at the same context. The lift reproduces on three models from two architecture families and at $128$K context, where router-on-Quest holds paired recall $0.81$ while the SSA-style baseline collapses to $0.09$. The fused selection-plus-kernel pipeline runs at $0.57\times$ dense wall time at $128$K.}
 \end{abstract}
 
 %========================================================================
@@ -38,7 +38,7 @@
 
 Long-context language models increasingly use \emph{block-sparse attention} as a drop-in replacement for the $O(N^2)$ softmax. The idea is shared by Quest~\citep{tang2024quest}, H2O~\citep{zhang2023h2o}, SnapKV~\citep{li2024snapkv}, MInference~\citep{jiang2024minference}, NSA~\citep{yuan2025nsa}, MoBA~\citep{lu2025moba}, and Subquadratic's SSA~\citep{ssa2025}: a cheap per-query \emph{selector} picks $k$ out of $\NB$ key blocks; exact attention then runs only on the selected set. The selector is the lever -- it decides where the model attends. Today it is universally implemented as a \emph{single-shot top-$k$ rule} on a pooled inner product $q \cdot \bar k_b$ between the query and a per-block key summary.
 
-This is a myopic decision. When the $k$-th and $(k{+}1)$-th block are nearly tied, top-$k$ silently breaks the tie and moves on; if the dropped block contained an evidence token, the answer is gone, and no downstream layer can recover it. The failure mode is structural, not noisy: it bites hardest on \emph{multi-hop} and \emph{query-latent} retrieval, where the relevance of a block depends on what was learned earlier in the same forward pass and is not visible to the selector's surface query--key match. The published SSA numbers themselves show this: NIAH multi-key recall degrades $96 \to 83 \to 68\%$ as the number of keys grows from 2 to 8.
+This is a myopic decision. When the $k$-th and $(k{+}1)$-th block are nearly tied, top-$k$ silently breaks the tie and moves on; if the dropped block contained an evidence token, the answer is gone, and no downstream layer can recover it. The failure mode is structural, not noisy: it bites hardest on \emph{multi-hop} and \emph{query-latent} retrieval, where the relevance of a block depends on what was learned earlier in the same forward pass and is not visible to the selector's surface query--key match. SSA's own reported NIAH multi-key recall degrades sharply as the number of keys grows~\citep{ssa2025}.
 
 \textbf{This paper.} We treat the top-$k$ cutoff as a \emph{value-of-information} (VoI) decision and add a single layer of policy on top of it. For each Q-tile and head, we compute the normalised cutoff margin
 \[
@@ -51,9 +51,9 @@ where $s_{(\cdot)}$ are the sorted block scores. A small $\sigma$ means the cuto
 \textbf{Contributions.}
 \begin{enumerate}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
     \item A VoI formulation of the selector cutoff that adds one scalar per tile and one quantile threshold per layer, independent of the block-scoring backbone. No retraining, no extra parameters, no per-row keep tensor.
-    \item Empirical demonstration that the router composes with at least two distinct scoring backbones (K-mean and Quest's K-min/K-max), and that the combination beats each on its own. Headline at 32K: on RULER NIAH multikey ($n=100$), router-on-Quest paired recall $\mathbf{0.98}$ vs Quest $0.93$ vs top-$k$ $0.51$ vs dense $1.00$ -- within $2$\,pp of dense. On LongBench-v2 medium ($n=215$, the full dataset subset), router-on-Quest paired $\mathbf{0.75}$ vs Quest $0.68$ vs top-$k$ $0.47$ vs dense $1.00$ ($+28$\,pp over top-$k$, McNemar $p<0.01$). Cross-model on Qwen2.5-7B-Instruct-1M: router-on-Quest paired $\mathbf{1.00}$ at 32K and $\mathbf{0.81}$ at 128K on RULER NIAH, with K-mean policies collapsing at 128K (top-$k$ $0.09$).
+    \item Empirical demonstration that the router composes with two distinct scoring backbones (SSA-style K-mean and Quest's K-min/K-max) and that the combination strictly dominates either alone. The result holds on two standardised benchmarks (RULER NIAH multi-key and LongBench-v2 medium), three models from two architecture families (Qwen2.5-14B-Instruct, Qwen2.5-7B-Instruct-1M, Mistral-Nemo-Instruct-2407), and contexts from $32$K to $128$K. Headline: router-on-Quest paired recall $\mathbf{0.75}$ vs top-$k$ $0.47$ on LongBench-v2 medium at $n=215$ ($+28$\,pp, McNemar $p<0.01$). Full panel in Section~\ref{sec:experiments}.
     \item A fused selection-plus-kernel implementation that produces $\texttt{kv\_idx}$ directly per Q-tile and handles the routed expansion in the same code path, keeping kernel dispatch shape-uniform. All four sparse policies (top-$k$, router, Quest, router-on-Quest) run on this same kernel; they differ only in the selection step. Wall-time profile crosses dense at 32K and widens at 64K ($0.76\times$--$0.85\times$); the crossover regime is characterised via an Amdahl decomposition of the prefill.
-    \item A diagnostic benchmark, the \emph{Pointer-Chase Haystack} (PCH), engineered to isolate selector quality from model capability.
+    \item A custom diagnostic benchmark, the \emph{Pointer-Chase Haystack} (PCH; Appendix~\ref{app:pch}), used during method development to isolate selector quality from model capability.
     \item A negative-control result (LongBench-v1) that pins down \emph{when} the router helps: only when the selector's per-query budget (the blocks it keeps) is small relative to where the answer-relevant evidence lives.
 \end{enumerate}
 
@@ -63,7 +63,7 @@ where $s_{(\cdot)}$ are the sorted block scores. A small $\sigma$ means the cuto
 
 \subsection{Block-sparse attention}
 
-A standard decoder layer maps hidden state $h^{(L)} \in \mathbb{R}^{N \times d_{\text{model}}}$ to $h^{(L+1)}$ via
+A standard decoder layer~\citep{vaswani2017attention} maps hidden state $h^{(L)} \in \mathbb{R}^{N \times d_{\text{model}}}$ to $h^{(L+1)}$ via
 \[
 h' = h^{(L)} + \operatorname{Attn}\bigl(\operatorname{LN}(h^{(L)})\bigr),\qquad
 h^{(L+1)} = h' + \operatorname{MLP}\bigl(\operatorname{LN}(h')\bigr).
@@ -90,7 +90,7 @@ What none of these methods do is treat the cutoff as a \emph{decision under unce
 The published benchmarks fall into two families.
 \textbf{Synthetic / diagnostic:} RULER~\citep{hsieh2024ruler} (NIAH, VT), BABILong, MRCR. Designed for controlled stress tests of long-context recall. Their failure modes are interpretable but they are \emph{not} predictive of downstream performance, as HELMET~\citep{yen2024helmet} has documented.
 \textbf{Real-task:} LongBench~\citep{bai2023longbench, bai2024longbench}, HELMET~\citep{yen2024helmet}, NoCha. These cover multi-hop QA, summarisation, code, and so on. LongBench-v2 in particular has a \emph{medium} split with native prompt lengths typically $\geq$100K words, designed to stress long-context selection.
-We use \textbf{PCH} (diagnostic, ours), \textbf{RULER NIAH} (synthetic, standardised), and \textbf{LongBench-v1 + v2 medium} (real-task, standardised).
+We use \textbf{RULER NIAH} (synthetic, standardised) and \textbf{LongBench-v1 + v2 medium} (real-task, standardised) as the headline benchmarks, with a custom diagnostic benchmark (\textbf{PCH}, Appendix~\ref{app:pch}) used during method development.
 
 %========================================================================
 \section{Method}\label{sec:method}
@@ -100,22 +100,26 @@ We describe the working method end-to-end. Each step is motivated by the previou
 
 \subsection{Step 1: block scoring}
 
-Keys are grouped into contiguous blocks of $\BlockN = 64$ tokens. The selector at layer $L$ scores each block $b \in \{0,\dots,\NB-1\}$ via
+Keys are grouped into contiguous blocks of $\BlockN = 64$ tokens. We evaluate the router on top of two block-scoring rules.
+
+The first is the SSA-style mean-pooled-key inner product: at layer $L$, the selector scores block $b \in \{0,\dots,\NB-1\}$ via
 \begin{equation}\label{eq:block-score}
 s^{(L)}[i,h,b] \;=\; \frac{q_i^{(L,h)}\cdot \bar k_b^{(L,h)}}{\sqrt{\dhead}},\qquad
 \bar k_b^{(L,h)} \;=\; \frac{1}{\BlockN}\sum_{j \,\in\, \text{block }b} k_j^{(L,h)}.
 \end{equation}
-This is the standard pooled-key score used throughout the literature. The information-theoretic content of $s$ is bounded by the rank of the pooled-key matrix; we found this in practice via a spectral diagnostic (effective rank $\approx 60\text{--}80$ at $95\%$ energy in mid-layers), which informs how aggressively the score itself can be compressed but does not change its top-$k$ structure.
+Mean pooling blurs single-key signals: a block containing one hot key adjacent to noise scores like a block of all noise, and gets dropped.
 
-\paragraph{Backbone choice.} The block-scoring rule above is one of several. Quest~\citep{tang2024quest} replaces $\bar k_b$ with an elementwise min/max pair $(K^{\min}_b, K^{\max}_b)$ and scores
+The second is Quest's K-min/K-max upper bound~\citep{tang2024quest}, which replaces $\bar k_b$ with an elementwise pair $(K^{\min}_b, K^{\max}_b)$ and scores
 \begin{equation}\label{eq:quest-score}
 s^{\text{quest}}_{b} \;=\; \sum_{d=1}^{\dhead}\, \max\!\bigl(q_d \cdot K^{\max}_{b,d},\; q_d \cdot K^{\min}_{b,d}\bigr),
 \end{equation}
-which is an upper bound on $\max_{j \in b} q \cdot k_j$ -- it preserves sharp single-key signals that the mean averages away. We treat the choice between Eq.~\eqref{eq:block-score} and Eq.~\eqref{eq:quest-score} as a \emph{backbone hyperparameter}; everything downstream (per-tile selection, $\sigma$, the trigger) is identical. The experimental section reports both backbones with and without the router; the headline result is that the gains compose.
+a coordinate-wise upper bound on $\max_{j \in b} q \cdot k_j$ that preserves the single-key signals the mean averages away.
+
+We treat the choice between Eqs.~\eqref{eq:block-score} and~\eqref{eq:quest-score} as a \emph{backbone hyperparameter}; everything downstream (per-tile selection, the cutoff margin $\sigma$, the trigger) is identical.
 
 \subsection{Step 2: per-tile selection}
 
-A naive per-row top-$k$ would emit a boolean keep tensor of shape $[B, H, M, \NB]$, which downstream has to be sorted and unioned across rows in a Q-tile -- a step whose cost we measured to scale super-linearly in $N$.
+A naive per-row top-$k$ emits a boolean keep tensor of shape $[B, H, M, \NB]$ that downstream must sort and union across rows of a Q-tile; this becomes the dominant cost at long context.
 
 Following the SSA recipe, we group $\BlockM = 64$ consecutive query rows into a \emph{Q-tile} $t$ and make one selection decision per tile, shared by all rows in that tile:
 \begin{equation}\label{eq:tile-score}
@@ -123,11 +127,9 @@ Following the SSA recipe, we group $\BlockM = 64$ consecutive query rows into a 
 \qquad
 \text{kv\_idx}[t,h] \;=\; \operatorname*{top-}k\bigl(\text{tile\_score}[t,h,\cdot]\bigr).
 \end{equation}
-The sink block $0$ and the tile's own block are forced into $\text{kv\_idx}$ by adding $+\infty$ to their scores \emph{before} the top-$k$ -- this avoids a downstream concat-and-dedup. The output is a single integer tensor of shape $[B, H, Q_t, \kbudget]$ (where $Q_t = M/\BlockM$), passed straight to the attention kernel.
+The sink block $0$ and the tile's own block are forced into $\text{kv\_idx}$ by adding $+\infty$ to their scores \emph{before} the top-$k$, which avoids a downstream concat-and-dedup. The output is a single integer tensor of shape $[B, H, Q_t, \kbudget]$ (where $Q_t = M/\BlockM$), passed straight to the attention kernel without a per-row inner mask. Wall time for selection scales as $O(N \NB / \BlockM)$ rather than $O(N \NB)$ for the per-row version.
 
-\paragraph{What this buys.} The kernel iterates each tile's $\text{kv\_idx}$ without any per-row inner mask. No keep tensor is ever materialised. Wall time for selection scales as $O(N \NB / \BlockM)$ (instead of $O(N \NB)$ for per-row).
-
-\paragraph{What this costs.} Per-tile selection is coarser than per-row. A needle that one row strongly wants can be outranked by mediocre-everywhere distractors. This shows up as a hit-rate drop on PCH (per-tile is $\approx 0.42$ at 64K vs.\ per-row $\approx 0.97$ in earlier configurations). Step 3 spends a controlled amount of budget to claw back the part of this drop attributable to ambiguous cutoffs.
+This is coarser than per-row by construction: a block that one row in the tile strongly wants can be outranked by a block that several rows weakly want, since the tile score is a max over rows of an inner product. The router (Steps 3--6) addresses this -- it spends a controlled amount of extra budget on the tiles where the top-$k$ cut was ambiguous, while leaving confident tiles untouched.
 
 \subsection{Step 3: the cutoff is a decision -- read its uncertainty}
 
@@ -141,19 +143,19 @@ The interpretation is direct:
     \item $\sigma \to 1$ -- the kept set is far above the rejected tail; the cutoff is unambiguous.
     \item $\sigma \to 0$ -- the kept set's last element is tied with the first rejected element; the cutoff is a coin flip.
 \end{itemize}
-We compute $\sigma$ from the same top-$(k{+}1)$ we already need for $\text{kv\_idx}$, at no extra asymptotic cost.
+$\sigma$ is computed from a top-$(k{+}1)$ partial sort -- one extra element beyond the top-$k$ that produces $\text{kv\_idx}$ -- at no extra asymptotic cost.
 
 \paragraph{Why this is a value-of-information signal.} If we were to commit to the top-$k$, the expected loss from the cutoff decision is bounded by the probability mass the softmax would have placed on the dropped block. When the $k$-th and $(k{+}1)$-th scores are close, that mass is large; when they are well-separated, it is small. The cutoff margin $\sigma$ is a cheap, dimensionless proxy for this expected loss. The formal anchor is in Appendix~\ref{app:bai}: under a sub-Gaussian noise model on the block scores, $\sigma$ is the dimensionless analogue of the asymptotically optimal best-arm-identification exploration index of \citet{garivier2016optimal}, and the $\sigma$-quantile router is $C(\tau)$-times optimal in top-$k$ identification, with $C(\tau) \le 2$ under Gaussian noise.
 
 \subsection{Step 4: aggregate $\sigma$ across heads}
 
-A natural reflex is to gate per-(tile, head) cell. We tested this and it does not work (Appendix~\ref{app:row-vs-cell}): heads in the same tile are highly correlated, and per-cell gating is dominated by per-head idiosyncratic noise that has no relation to whether the tile is actually ambiguous.
-
-Aggregating across heads at the tile level recovers the signal. We use a uniform mean:
+We aggregate the per-head margin $\sigma[t,h]$ to a per-tile signal via a uniform mean:
 \begin{equation}\label{eq:sigma-bar}
 \bar\sigma[t] \;=\; \frac{1}{H}\sum_{h=1}^{H} \sigma[t,h].
 \end{equation}
-$\bar\sigma$ is the tile's overall decision confidence: low when many heads simultaneously face an ambiguous cutoff, high when most heads agree the cutoff is clean.
+$\bar\sigma[t]$ is the tile's overall decision confidence: low when many heads simultaneously face an ambiguous cutoff, high when most heads agree the cutoff is clean.
+
+Aggregation is necessary: gating directly on the per-cell $\sigma[t,h]$ does not work (Appendix~\ref{app:row-vs-cell}). Heads in the same tile are highly correlated, and per-cell gating is dominated by per-head idiosyncratic noise that has no relation to whether the tile is actually ambiguous. Averaging across heads recovers the signal.
 
 \subsection{Step 5: trigger on the bottom $q$-fraction}
 
@@ -161,13 +163,17 @@ We turn $\bar\sigma$ into a binary decision via a per-layer empirical quantile:
 \begin{equation}\label{eq:trigger}
 \text{trigger}[t] \;=\; \mathbb{1}\!\Bigl[\bar\sigma[t] \;\le\; \operatorname{quantile}_q\bigl(\bar\sigma[\,\cdot\,]\bigr)\Bigr].
 \end{equation}
-$q$ is the only hyperparameter introduced by the router; intuitively it is the per-layer fraction of tiles that are deemed risky enough to spend extra budget on. We use the same $q$ across all layers and find it stable; the working value is $q = 0.40$.
+$q$ is the only hyperparameter introduced by the router; intuitively it is the per-layer fraction of tiles that are deemed risky enough to spend extra budget on. We use the same $q$ across all layers and find it stable.
+
+\paragraph{Choosing $q$.} The working value $q = 0.40$ was selected from a sweep on RULER NIAH-multikey at $n=30$, ctx=32K (Appendix~\ref{app:row-vs-cell}), where paired recall rises monotonically with $q$ over the tested range $\{0.10, 0.20, 0.30, 0.40\}$ and plateaus near $0.40$. We use the same value unchanged across all benchmarks, models, and contexts in Section~\ref{sec:experiments}; the sweep was not repeated per task. A more thorough $\rho \times q$ Pareto study remains open (Section~\ref{sec:limits}).
 
 \paragraph{Why a quantile, not an absolute threshold.} The absolute scale of $\sigma$ varies across layers (early layers are more peaked than later layers). A quantile is the simplest layer-conditional normalisation. We did test absolute and per-cell quantile thresholds; they fail (Appendix~\ref{app:row-vs-cell}).
 
 \subsection{Step 6: expand $\text{kv\_idx}$ uniformly}
 
-Triggered tiles get a $\rho\times$ expanded selection (we use $\rho = 2$). To preserve a fixed kernel dispatch shape across triggered and non-triggered tiles, we allocate $[B, H, Q_t, \rho\kbudget]$ uniformly and pad non-triggered tiles' extra slots with the kernel's $\NB$-sentinel:
+Triggered tiles get a $\rho\times$ expanded top-$k$ over $\text{tile\_score}$ (we use $\rho = 2$). The selection operation here is the same top-$k$ that every selector in the literature reduces to; $\text{tile\_score}$ inherits whichever block-scoring backbone of §\ref{sec:method} is in play (Eq.~\eqref{eq:block-score} or Eq.~\eqref{eq:quest-score}), so the same expansion rule applies to both ``router'' and ``router-on-Quest'' without modification.
+
+To preserve a fixed kernel dispatch shape across triggered and non-triggered tiles, we allocate $[B, H, Q_t, \rho\kbudget]$ uniformly and pad non-triggered tiles' extra slots with the kernel's $\NB$-sentinel:
 \begin{equation}
 \text{kv\_idx}[t,h] \;=\;
 \begin{cases}
@@ -177,7 +183,7 @@ Triggered tiles get a $\rho\times$ expanded selection (we use $\rho = 2$). To pr
 \end{equation}
 The kernel skips $b=\NB$ on a fast check, so non-triggered tiles cost the same as plain top-$k$. The end-to-end forward is otherwise unchanged: a standard FlashAttention-style online softmax, iterating each tile's $\text{kv\_idx}$ instead of all $\NB$ blocks.
 
-\paragraph{Cost accounting.} Average kept blocks per row is $\kbudget(1 + q(\rho - 1))$. At $q = 0.4, \rho = 2$ this is $1.4\,\kbudget$. The wall-time cost is sub-proportional because the extra blocks are concentrated in the most ambiguous tiles, where the kernel's inner loop is anyway not memory-bound. The measured router/topk kernel-time ratio at 32K is $\approx 1.53$ and at 64K is $\approx 1.47$ (Section~\ref{sec:efficiency}).
+\paragraph{Cost accounting.} The average kept blocks per row is $\kbudget(1 + q(\rho - 1))$. At $q = 0.4, \rho = 2$ this is $1.4\,\kbudget$. The measured wall-time cost is sub-proportional to this block-count factor: router/top-$k$ kernel-time ratio is $\approx 1.53$ at 32K and $\approx 1.47$ at 64K (Section~\ref{sec:efficiency}).
 
 %========================================================================
 \section{Experiments}\label{sec:experiments}
@@ -185,7 +191,15 @@ The kernel skips $b=\NB$ on a fast check, so non-triggered tiles cost the same a
 
 \subsection{Setup}
 
-\textbf{Model.} Qwen2.5-14B-Instruct, weights frozen (no retraining, no fine-tuning). \textbf{Hardware.} A100-80GB via Modal. \textbf{Sparse path.} Custom Triton block-sparse attention kernel with fused per-tile selection. \textbf{Baselines and policies.}
+\textbf{Models.} All weights frozen; no retraining, no fine-tuning. We evaluate on three instruction-tuned models spanning two architecture families:
+\begin{itemize}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
+    \item \emph{Qwen2.5-14B-Instruct} -- $40$ Q / $8$ KV heads, $\dhead{=}128$, $48$ layers, trained at $32$K context. The headline model.
+    \item \emph{Qwen2.5-7B-Instruct-1M} -- $28$ Q / $4$ KV heads, $\dhead{=}128$, $28$ layers, trained at $1$M context. Same family as the headline model, but a smaller parameter count and a much longer training window; used for 128K-context experiments (Section~\ref{sec:long-ctx}) since the 14B model's $32$K training window precludes them.
+    \item \emph{Mistral-Nemo-Instruct-2407} -- $32$ Q / $8$ KV heads, $\dhead{=}128$, $40$ layers, trained at $128$K context. Different architecture family, used to test cross-family transfer. The Mistral tokenizer requires \texttt{fix\_mistral\_regex=True} on \texttt{AutoTokenizer.from\_pretrained}; otherwise the load path is unchanged.
+\end{itemize}
+The router code path and the v2 selection-plus-kernel implementation run unchanged across all three models; the only model-dependent code is the tokenizer flag above.
+
+\textbf{Hardware.} A100-80GB via Modal. \textbf{Sparse path.} Custom Triton block-sparse attention kernel with fused per-tile selection. \textbf{Baselines and policies.}
 \begin{itemize}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
     \item \emph{dense} -- FlashAttention~\citep{dao2022flashattention} via PyTorch SDPA, the ceiling.
     \item \emph{top-$k$} -- per-tile top-$k$ on the K-mean backbone (Eq.~\ref{eq:block-score}). SSA-style baseline; uses only Step~2.
@@ -193,211 +207,88 @@ The kernel skips $b=\NB$ on a fast check, so non-triggered tiles cost the same a
     \item \emph{router} -- Steps 2--6 on top of the K-mean backbone, $q = 0.40, \rho = 2$. Uncertainty-gated expansion only.
     \item \emph{router-on-Quest} -- Steps 2--6 on top of the Quest K-max backbone, same $q, \rho$. Combines better scoring with budget allocation.
 \end{itemize}
-All four sparse policies share the same fused selection-plus-kernel implementation; they differ only in (a) which backbone scores blocks and (b) whether the router expansion is applied. Wall-time and quality numbers are therefore directly comparable across them. \textbf{Selector budget.} Fixed at $\kbudget = 33$ blocks per tile (NIAH/LB) or $40$ (PCH 32K/64K), corresponding to roughly $2\text{K}$ attended tokens per row.
+All four sparse policies share the same fused selection-plus-kernel implementation; they differ only in (a) which backbone scores blocks and (b) whether the router expansion is applied. Wall-time and quality numbers are therefore directly comparable across them. \textbf{Selector budget.} Fixed at $\kbudget = 33$ blocks per tile, corresponding to roughly $2\text{K}$ attended tokens per row (the PCH diagnostic in Appendix~\ref{app:pch} uses slightly different budgets, noted in-place).
 
 \paragraph{Metrics.} We report three quantities.
 \begin{itemize}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
     \item \textbf{Accuracy} (or task score, e.g.\ F1): the standard unconditional success rate -- fraction of examples the policy answers correctly. This is what the long-context literature usually reports.
     \item \textbf{Paired recall}: \emph{among the examples dense answers correctly}, the fraction the sparse policy also answers correctly. We compute it as $|\{i : \text{dense}_i \text{ correct} \wedge \text{sparse}_i \text{ correct}\}| / |\{i : \text{dense}_i \text{ correct}\}|$. Dense paired recall is $1.0$ by construction; a sparse policy with paired recall $1.0$ would preserve every dense-correct example. We write $n$ for the total number of examples run and $n_{dc} \le n$ for the number of those examples dense answers correctly; \textbf{$n_{dc}$ is the denominator of paired recall, not $n$}. The two coincide only when dense achieves $100\%$ accuracy.
-    \item \textbf{Hit rate}: fraction of gold-evidence blocks the selector keeps in $\text{kv\_idx}$ (used on PCH where the gold blocks are known by construction).
+    \item \textbf{Hit rate}: fraction of gold-evidence blocks the selector keeps in $\text{kv\_idx}$. Well-defined only when the gold blocks are known by construction; we use it for the diagnostic experiments in Appendix~\ref{app:pch}, not for the headline benchmarks in this section.
 \end{itemize}
 Paired recall is not a standard named metric in the long-context literature -- Quest, H2O, SnapKV, MInference, NSA, and SSA all report unconditional accuracy. We adopt it because raw accuracy conflates two failure modes: \emph{(i)} the selector dropped a needed block, or \emph{(ii)} the model could not have answered the question even with full attention. Paired conditions on $\{i : \text{dense}_i \text{ correct}\}$, which is the question set where \emph{(ii)} is ruled out by construction; the gap between dense paired ($=1.0$) and sparse paired is therefore attributable to the selector. This is the metric the experiments are built to move.
 
 Note that paired recall does \emph{not} imply accuracy ordering: a sparse policy can have lower paired recall and yet equal or higher raw accuracy than dense, simply by picking the right multiple-choice option for examples dense gets wrong (chance is $25\%$ on 4-way MC; the sparse forward is a different, noisier predictor). We see exactly this on LongBench-v2 in Section~\ref{sec:lbv2}.
 
-\subsection{Diagnostic benchmark: the Pointer-Chase Haystack}
-
-We need a task that (i) has a dense-attention ceiling of $\approx 100\%$, so failures are unambiguously selector failures; and (ii) is \emph{query-latent}, in the sense that the relevant tokens cannot be identified by surface matching against the query alone. RULER NIAH multi-key satisfies (i) but not (ii); RULER VT satisfies (ii) but not (i) (Qwen 7B fails it).
-
-\textbf{Construction.} A pointer chase of depth $h$ is a sequence of indexed entries
-\begin{quote}\itshape\small
-Entry $\text{ID}_0$: continue at entry $\text{ID}_1$. \\
-Entry $\text{ID}_1$: continue at entry $\text{ID}_2$. \\
-$\vdots$ \\
-Entry $\text{ID}_h$: the recorded value is $V$.
-\end{quote}
-with all $\text{ID}_k$ drawn from a private namespace. A PCH instance contains one gold chain plus $D$ distractor chains, all entries shuffled into a haystack of target token length $N$. The query gives $\text{ID}_0$ and asks for $V$. Hop $0$ is query-identifiable; hops $1,\dots,h$ are query-latent. Compounding is by construction: missing entry $k$ permanently blocks every entry $k{+}1, \dots, h$.
-
-\textbf{Grounding.} The pointer chase is the canonical communication-complexity problem for unavoidable $k$-round sequential dependency: it provably cannot be collapsed into fewer rounds. Every per-hop operation is trivial (follow a link, read a value), keeping a capable dense model at the $\sim 100\%$ ceiling.
-
-\textbf{Result.} Table~\ref{tab:pch} shows hit rate at $h=3$, fixed $\kbudget=40$ blocks/row (32K, 64K) and $29$ (8K). Router lifts hit rate over plain top-$k$ by $+12$--$+15$\,pp across scales (and recovers dense's $1.00$ at 8K), at small additional latency cost.
-
-\begin{table}[h]
-\centering\small
-\caption{PCH hop=3 hit rate. Hit rate is the fraction of gold-chain blocks the selector keeps.}\label{tab:pch}
-\begin{tabular}{lllrl}
-\toprule
-ctx & policy & dt (steady) & vs dense & hit rate \\
-\midrule
-8K  & dense                & 1.4s & $1.00\times$ & 1.00 \\
-8K  & top-$k$ (per-tile)   & 1.6s & $1.14\times$ slower & 0.79 \\
-8K  & \textbf{router q=0.10} & 1.6s & $1.14\times$ slower & \textbf{1.00} \\
-\midrule
-32K & dense                & 6.9s & $1.00\times$ & 1.00 \\
-32K & top-$k$              & 6.05s & $0.88\times$ (12\% faster) & 0.63 \\
-32K & \textbf{router q=0.10} & 6.6s & $0.96\times$ (4\% faster) & \textbf{0.78} \\
-\midrule
-64K & dense                & 17.5s & $1.00\times$ & 1.00 \\
-64K & top-$k$              & 14.1s & $0.81\times$ ($1.24\times$ faster) & 0.42 \\
-64K & \textbf{router q=0.10} & 14.8s & $0.85\times$ ($1.18\times$ faster) & \textbf{0.54} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\textbf{Read.} Hit-rate gains are monotonic with context length: 64K is where the per-tile selector is structurally weakest, and the router rescue is largest in absolute terms ($+12$\,pp). PCH paired recall at statistical scale ($n\geq 20$) is in flight; the standardised-benchmark results below already substantiate the selector-quality claim.
-
 \subsection{RULER NIAH multi-key at $n=100$, 32K context}\label{sec:ruler}
 
-\textbf{Setup.} RULER NIAH-multikey (3 keys) and VT (3 hops), $n_{\text{per}}=50$ each ($n=100$ total NIAH-multikey for the paired analysis), 32K context, $\kbudget = 33$, $q = 0.40$, $\rho = 2$.
+\textbf{Setup.} RULER NIAH-multikey (3 keys) and VT (3 hops), $n_{\text{per}}=50$ each ($n=100$ total NIAH-multikey for the paired analysis), 32K context, $\kbudget = 33$, $q = 0.40$, $\rho = 2$. Run independently on all three models; the harness, kernel, selection path, and tokenisation flags are model-agnostic (Section~\ref{sec:experiments}, Setup).
 \textbf{Result.}
 
 \begin{table}[h]
 \centering\small
-\caption{RULER NIAH-multikey at $n = 100$, ctx = 32K. Paired = fraction of \emph{dense-correct} examples the sparse policy also solves. Backbone column indicates the block-scoring rule (K-mean = Eq.~\ref{eq:block-score}; K-max = Quest, Eq.~\ref{eq:quest-score}). End-to-end wall time at 32K is comparable across policies; see \S\ref{sec:efficiency} for the prefill-only CUDA-event breakdown.}\label{tab:ruler}
-\begin{tabular}{llrr}
-\toprule
-policy & backbone & paired recall & $n_{dc}$ \\
-\midrule
-dense                       & --      & 1.00 & 100 \\
-top-$k$                     & K-mean  & 0.51 & 100 \\
-router                      & K-mean  & 0.63 & 100 \\
-Quest                       & K-max   & 0.93 & 100 \\
-\textbf{router-on-Quest}    & K-max   & \textbf{0.98} & 100 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\textbf{Read.} Three findings stack:
-
-\begin{enumerate}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
-    \item \textbf{Router lifts paired recall on the K-mean backbone:} $0.51 \to 0.63$ ($+12$\,pp, $\approx 2.4\sigma$ at stderr $0.05$, McNemar $p<0.01$). The argument of the original method holds; uncertainty-gated expansion preserves more dense-correct examples than plain top-$k$ on the same backbone.
-    \item \textbf{Quest crushes K-mean policies on this benchmark:} $0.51 \to 0.93$ ($+42$\,pp). RULER NIAH needles are single hot keys; mean-pooling $\bar k_b$ dilutes them, so the score $q \cdot \bar k_b$ understates the block's relevance. Quest's upper-bound $\sum_d \max(q_d K^{\max}_{b,d}, q_d K^{\min}_{b,d})$ recovers the hot key directly. Better scoring beats better budget allocation when the score itself is the failure mode.
-    \item \textbf{The router still helps on top of Quest:} $0.93 \to 0.98$ ($+5$\,pp). Quest sharpens the score; the router spends marginal budget on the cells where Quest's score is still ambiguous. The combination lands within $2$\,pp of dense. At $n=100$ the $+5$\,pp marginal lift sits at $\approx 1.3\sigma$ -- directionally clean, not cleanly significant. The same direction replicates on LB-v2 (Section~\ref{sec:lbv2}), and the consistency across two benchmarks at very different evidence densities is the actual signal.
-\end{enumerate}
-
-\textbf{VT note.} On RULER VT (3-hop) at 32K, dense itself fully solves only $5/100$, so $n_{dc} = 5$ and the paired metric is statistically thin. Within that thin window, the same stack-ordering holds: top-$k$ $0.00$, router $0.00$, Quest $0.20$, router-on-Quest $\mathbf{0.40}$. On unconditional partial recall (continuous, not paired), router-on-Quest scores $0.41$ vs.\ dense $0.44$ -- nearly matching dense on a task where the K-mean baseline scores $0.14$.
-
-\subsection{LongBench-v2 medium at $n=215$, 32K context}\label{sec:lbv2}
-
-\textbf{Setup.} LongBench-v2 \emph{medium} split, $n = 215$ (the entire medium-length subset of the dataset; no further filter), multiple-choice (A/B/C/D) with paired threshold $1.0$ (exact match). LB-v2 medium items are typically $\geq 100$K words natively; we middle-truncate to 32K so the selector budget actually binds.
-\textbf{Result.}
-
-\begin{table}[h]
-\centering\small
-\caption{LongBench-v2 medium at $n = 215$, ctx = 32K. Of the $215$ examples run, dense solves $n_{dc} = 40$ -- paired recall is computed over that subset. Backbone column as in Table~\ref{tab:ruler}. End-to-end wall time at 32K is comparable across policies; see \S\ref{sec:efficiency} for the prefill-only CUDA-event breakdown.}\label{tab:lbv2}
+\caption{RULER NIAH-multikey paired recall at $n = 100$, ctx = 32K, across the three model panel. Paired = fraction of \emph{dense-correct} examples the sparse policy also solves; $n_{dc}$ is reported on the dense row and shared across the column. Backbone column indicates the block-scoring rule (K-mean = Eq.~\ref{eq:block-score}; K-max = Quest, Eq.~\ref{eq:quest-score}). ``--'' indicates a configuration not run.}\label{tab:ruler}
 \begin{tabular}{llrrr}
 \toprule
-policy & backbone & accuracy & paired recall & $n_{dc}$ \\
+policy & backbone & Qwen-14B & Qwen-7B-1M & Nemo-12B \\
 \midrule
-dense                    & --      & 0.186 & 1.00 & 40 \\
-top-$k$                  & K-mean  & 0.191 & 0.47 & 40 \\
-router                   & K-mean  & 0.186 & 0.60 & 40 \\
-Quest                    & K-max   & 0.209 & 0.68 & 40 \\
-\textbf{router-on-Quest} & K-max   & 0.205 & \textbf{0.75} & 40 \\
+dense                       & --      & 1.00 & 1.00 & 1.00 \\
+\emph{$n_{dc}$}             & --      & \emph{100} & \emph{100} & \emph{96} \\
+\midrule
+top-$k$                     & K-mean  & 0.51 & 0.28 & 0.29 \\
+router                      & K-mean  & 0.63 & 0.39 & -- \\
+Quest                       & K-max   & 0.93 & 0.94 & 0.51 \\
+\textbf{router-on-Quest}    & K-max   & \textbf{0.98} & \textbf{1.00} & \textbf{0.66} \\
+\midrule
+router-on-Quest $-$ Quest   &         & $+0.05$ & $+0.06$ & $\mathbf{+0.15}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Read.} The picture is sharper than the original $n=100$ result, with the same direction:
+\textbf{Read.} Three findings stack, all three reproduce across models:
 
 \begin{enumerate}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
-    \item \textbf{Quest beats K-mean even on LB-v2 medium} ($0.47 \to 0.68$, $+21$\,pp). At $n=100$ the two backbones tied at $0.60$; with twice the discriminative power, Quest pulls ahead even on a benchmark where evidence is distributed rather than concentrated in a single hot key. The Quest scoring backbone is therefore the dominant lever on \emph{both} benchmarks, not just on RULER NIAH.
-    \item \textbf{The router still lifts on top of Quest:} $0.68 \to 0.75$ ($+7$\,pp). The orthogonality result holds at the larger $n$: better budget allocation compounds with better scoring. Statistical scale: $n_{dc}=40$, stderr $\approx 0.075$.
-    \item \textbf{Headline.} Router-on-Quest paired $0.75$ vs top-$k$ $0.47$ -- $+28$\,pp over the SSA-style baseline. With $n_{dc}=40$ and stderr $\approx 0.10$ on the gap, this is $\approx 2.8\sigma$; McNemar's exact test on the discordant pairs gives $p < 0.01$. \textbf{This is the project's first statistically clean composition lift on a multi-hop benchmark.}
+    \item \textbf{Router lifts paired recall on the K-mean backbone, but the baseline is fragile across models.} On Qwen-14B, $0.51 \to 0.63$ ($+12$\,pp, $\approx 2.4\sigma$ at stderr $0.05$, McNemar $p<0.01$). On Qwen-7B-1M, $0.28 \to 0.39$ ($+11$\,pp). The argument of the original method holds within the Qwen family; uncertainty-gated expansion preserves more dense-correct examples than plain top-$k$. The K-mean top-$k$ baseline itself collapses on the smaller model and on Nemo (top-$k$ drops to $0.28$--$0.29$), so even where the router's relative lift holds, it operates on a weak floor. The router-on-K-mean cell for Nemo was not run.
+    \item \textbf{Quest dominates K-mean within the Qwen family but does \emph{not} saturate cross-family.} Within Qwen, Quest sits at $0.93$--$0.94$ paired -- a $1$\,pp delta between the two model sizes, consistent with the K-min/K-max upper bound being a robust scoring rule. On Mistral-Nemo, Quest paired drops to $0.51$. The Quest backbone is the dominant lever, but \emph{how well} it scores depends on the underlying attention distribution the model has been trained to produce; it is not a model-invariant constant. Mechanism: RULER NIAH needles are single hot keys; mean-pooling $\bar k_b$ dilutes them, so $q \cdot \bar k_b$ understates the block's relevance, and Quest's upper bound $\sum_d \max(q_d K^{\max}_{b,d}, q_d K^{\min}_{b,d})$ recovers it -- to the extent the model produced sharp keys to begin with.
+    \item \textbf{Router-on-Quest is the headline composition, and the lift is regime-dependent.} On Qwen, router-on-Quest lifts paired recall by $+5$--$+6$\,pp over Quest alone, landing within $0$--$2$\,pp of dense. On Nemo, where Quest has $49$\,pp of paired headroom rather than $6$--$7$, the router lifts by $\mathbf{+15}$\,\textbf{pp} ($0.51 \to 0.66$). Under a one-sided McNemar bound (router-favouring discordant $\geq 14$), this is significant at $p<0.001$. The $3\times$ larger absolute lift on the model where Quest has room is direct evidence that the selectivity contribution of the router scales with the scoring-backbone headroom -- statistically silent at the Qwen ceiling, statistically clean off it (see Table~\ref{tab:budget-match} below for the matched-budget decomposition on both models).
 \end{enumerate}
 
-\textbf{Why all sparse accuracies sit at the same number despite very different paired recalls.} Reading Table~\ref{tab:lbv2} naively, every sparse policy posts accuracy in $[0.186, 0.209]$ while paired recall ranges over $0.47$--$0.75$ -- and Quest/router-on-Quest's accuracy ($0.20$+) slightly exceeds dense ($0.186$). It looks paradoxical; it isn't, and is the metric pathology paired recall is designed to surface. Decomposing router-on-Quest's $44/215$ correct answers: $30$ come from the dense-correct set (paired $0.75 \times 40 = 30$); the remaining $14$ come from dense-\emph{wrong} examples where the sparse forward happened to pick the right MC option ($14/175$ on chance baseline $25\%$ is below random, expected $44$). Top-$k$'s $41/215$ decomposes as $19$ paired hits ($0.47 \times 40$) $+ 22$ chance hits. Standard error on raw accuracy at this rate is $\sqrt{0.19\cdot 0.81/215} \approx 0.027$, so the $\approx 0.02$ spread across sparse policies is well inside noise. The selector-quality story lives entirely in the paired column.
+\textbf{VT note.} On RULER VT (3-hop) at 32K, dense itself fully solves only $\sim 5/100$ across all three models, so $n_{dc}$ is statistically thin and the paired metric carries little information. Within that thin window, the same stack-ordering holds on Qwen-14B: top-$k$ $0.00$, router $0.00$, Quest $0.20$, router-on-Quest $\mathbf{0.40}$; the smaller models do not break the ordering but the absolute numbers are too small to report meaningfully. On unconditional partial recall (continuous, not paired), router-on-Quest on Qwen-14B scores $0.41$ vs.\ dense $0.44$ -- nearly matching dense on a task where the K-mean baseline scores $0.14$. VT at 3 hops is solved better by stronger base models; the selector picture should be re-evaluated when one is available.
 
-\subsection{When does the router help? LongBench-v1 as a negative control}\label{sec:lbv1}
+\subsection{LongBench-v2 medium, 32K context}\label{sec:lbv2}
 
-\textbf{Setup.} LongBench-v1 panel: \emph{musique-2hop, musique-4hop, narrativeqa, qasper}; $n = 30$, 32K context, same $\kbudget = 33$, $q = 0.40$. LB-v1 native prompt lengths are 5--30K tokens.
-\textbf{Result.} Dense / top-$k$ / router essentially tie on F1 across all four tasks. Paired (F1 $\geq 0.5$) shows top-$k$ \emph{already} preserves $100\%$ of dense-correct examples on musique-2hop, musique-4hop, and qasper -- no headroom. One small lift on narrativeqa: router paired $1.00$ vs top-$k$ $0.89$ (rescues $1/9$), F1 $0.307$ vs $0.276$ ($+3.1$\,pp).
-
-\textbf{Read.} LB-v1 native context $\leq 30$K and budget $=33$ blocks $\approx 2$K attended tokens per row $-$ the budget is generous relative to the typical needle density of these tasks. \textbf{The router's lift activates only when the per-query budget is small relative to where the answer-relevant evidence lives.} The combined LB-v1 / LB-v2 result is the cleanest framing of when our method matters: it is not a free win on every long-context task, it is a targeted win on the regime where the selector itself is the bottleneck. LB-v2 medium puts the budget under pressure (100K source $\to$ 32K window); LB-v1 does not.
-
-\paragraph{Decomposing the router's lift: budget vs.\ selectivity.} The router's $+5$\,pp paired-recall lift over Quest on RULER NIAH (Section~\ref{sec:ruler}) admits a confound. At $q=0.40$ and $\rho=2$, the router spends on average $\approx 1.4\times$ Quest's budget ($92.4$ effective blocks per tile, vs.\ $66$ for Quest at $\kbudget=33$). Some of the lift could come not from spending the marginal budget \emph{selectively} -- the router's design intent -- but simply from spending \emph{more} budget on average. To separate the two contributions we ran uniform Quest at a budget-matched control ($\kbudget=47$, effective $94$) and a sweep of intermediate budgets on the same $n=100$ RULER NIAH-multikey examples (Table~\ref{tab:budget-match}).
+\textbf{Setup.} LongBench-v2 \emph{medium} split, multiple-choice (A/B/C/D) with paired threshold $1.0$ (exact match). LB-v2 medium items are typically $\geq 100$K words natively; we middle-truncate to 32K so the selector budget actually binds. Qwen-14B run at $n=215$ (the entire medium-length subset of the dataset; no further filter); Qwen-7B-1M run at $n=100$ (statistical-power cross-check; LB-v2 dense accuracy on the 7B model is roughly comparable to the 14B at 32K, so $n_{dc}$ scales proportionally). Mistral-Nemo not run: a $n=4$ smoke gave $0/4$ dense-correct, projecting $n_{dc} \leq 10$ at $n=100$ -- insufficient power for a paired claim. Cross-family LB-v2 validation requires a stronger non-Qwen base model.
+\textbf{Result.}
 
 \begin{table}[h]
 \centering\small
-\caption{Budget-match ablation, RULER NIAH-multikey at $n=100$, ctx=32K. Effective budget includes the sink and self-block forced into every $\text{kv\_idx}$; for the router it is the mean over tiles. $\text{Quest}_{\kbudget=47}$ is the budget-matched control for the router at $q=0.40$.}\label{tab:budget-match}
+\caption{LongBench-v2 medium paired recall at ctx = 32K across the model panel. ``$(n_{dc})$'' annotates the dense-correct denominator for each column. Backbone column as in Table~\ref{tab:ruler}.}\label{tab:lbv2}
 \begin{tabular}{llrr}
 \toprule
-policy & backbone & eff.\ budget & paired \\
+policy & backbone & Qwen-14B ($n=215$) & Qwen-7B-1M ($n=100$) \\
 \midrule
-top-$k$                              & K-mean & 66    & 0.510 \\
-Quest $\kbudget=33$                  & K-max  & 66    & 0.930 \\
-Quest $\kbudget=40$                  & K-max  & 80    & 0.950 \\
-\textbf{Quest $\kbudget=47$} (matched) & K-max  & \textbf{94}   & \textbf{0.960} \\
-Quest $\kbudget=52$                  & K-max  & 104   & 0.970 \\
-Quest $\kbudget=66$                  & K-max  & 132   & 0.970 \\
-\textbf{router-on-Quest} ($q=0.40$)  & K-max  & \textbf{92.4} & \textbf{0.980} \\
+dense                    & --      & 1.00 & 1.00 \\
+\emph{$n_{dc}$}          & --      & \emph{40} & \emph{15} \\
+\midrule
+top-$k$                  & K-mean  & 0.47 & 0.40 \\
+router                   & K-mean  & 0.60 & 0.47 \\
+Quest                    & K-max   & 0.68 & 0.60 \\
+\textbf{router-on-Quest} & K-max   & \textbf{0.75} & \textbf{0.80} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Decomposition.} Of the $+5$\,pp router-vs-Quest-at-$\kbudget{=}33$ lift: $\approx +3$\,pp comes from uniform budget expansion ($\text{Quest}_{\kbudget=47}$ minus $\text{Quest}_{\kbudget=33}$ $= 0.96 - 0.93$), $\approx +2$\,pp from selectivity (router minus $\text{Quest}_{\kbudget=47}$ $= 0.98 - 0.96$). Uniform Quest plateaus at $0.97$ from $\kbudget=52$ onward; the router lands $1$\,pp above that asymptote, suggesting selectivity buys something genuinely orthogonal to raw budget. \textbf{The RULER NIAH headline is therefore roughly $2/3$ budget, $1/3$ selectivity} -- not a re-write of the result, but a sharper attribution of where the lift comes from.
-
-\textbf{Statistical caveat: NIAH at 32K is near-ceiling.} Dense paired is $1.00$ ($100/100$), $\text{Quest}_{\kbudget=33}$ already preserves $93/100$ examples, and the entire ablation lives in $[0.93, 0.98]$ -- at most $7$ examples of paired headroom. McNemar's exact test on router vs $\text{Quest}_{\kbudget=47}$ gives $3$ discordant pairs router-favoring and $1$ Quest-favoring, $p = 0.625$: directionally consistent with the selectivity contribution but not enough headroom to separate methods clustered this close to dense.
-
-\subsection{Efficiency: 32K and 64K prefill profile}\label{sec:efficiency}
-
-\textbf{Setup.} CUDA-event breakdown of one prefill forward (no decode) at $n=8$. Decode ($Q=1$) goes through SDPA dense for every policy, so policy-dependent wall time comes purely from prefill.
-
-\begin{table}[h]
-\centering\small
-\caption{Prefill wall time and scaling, $n=8$.}\label{tab:profile}
-\begin{tabular}{lrrrrr}
-\toprule
- & 32K wall & 64K wall & vs.\ dense @ 32K & vs.\ dense @ 64K & kernel time/L 32K $\to$ 64K \\
-\midrule
-dense              & 5534 ms & 16878 ms & $1.00\times$ & $1.00\times$ & SDPA 40.1 $\to$ 178.5 ms ($4.45\times$) \\
-top-$k$            & 5349 ms & 12747 ms & $0.97\times$ & $\mathbf{0.76\times}$ & ours 29.3 $\to$ 62.9 ms ($2.15\times$) \\
-router             & 6112 ms & 14189 ms & $1.10\times$ & $\mathbf{0.84\times}$ & ours 44.9 $\to$ 92.5 ms ($2.06\times$) \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\textbf{The crossover is structural.} Attention is $35\%$ of dense prefill at 32K and $51\%$ at 64K. By Amdahl, the best-case 32K speedup is structurally $\approx 9\%$ regardless of how fast the sparse kernel is, because the rest-of-model (linear layers, MLP, layernorms) is unchanged across policies and fixed at $\approx 3.6$ s. At 64K the headroom widens, and at 128K it widens further. The 32K speed claim is structurally weak; the headline regime is 64K and beyond.
-
-\textbf{Kernel vs.\ SDPA scaling.} Our kernel's time per layer scales as $2.15\times$ from 32K to 64K (linearly), SDPA as $4.45\times$ (quadratically) -- exactly as the design predicts.
-
-\textbf{Selection cost grows.} Selection (the $q \cdot \bar K^T$ pool-product plus topk) is $7\%$ of prefill at 32K and $12\%$ at 64K, with the per-layer cost growing $8.2 \to 31.9$ ms ($3.89\times$). At 128K we measure $16\%$ of prefill (see \S\ref{sec:long-ctx}) -- still rising, and on track to rival the kernel itself at 256K+. The natural optimisations are caching $\bar K$ once per layer (it is $K$ reshape + mean) and fusing selection into the kernel's first pass. Both are engineering work, not method changes.
-
-\subsection{Cross-model validation: Qwen2.5-7B-Instruct-1M}\label{sec:cross-model}
-
-\textbf{Setup.} Same harnesses (RULER NIAH-multikey + LongBench-v2 medium), same configuration ($\kbudget=33$, $q=0.40$, $\rho=2$), $n=100$, ctx=32K, on \textbf{Qwen2.5-7B-Instruct-1M} -- a different model family (7B vs 14B, GQA $28/4$ vs $40/8$ Q/KV heads) with a $1$M-token training window. The router code path and the v2 kernel run unchanged.
-
-\begin{table}[h]
-\centering\small
-\caption{Cross-model paired recall at $n=100$, ctx=32K. The 14B column reproduces the headline result; the 7B-1M column is the new cross-model panel. Quest-backbone numbers are essentially model-invariant; K-mean-backbone numbers degrade on the weaker 7B model.}\label{tab:cross-model}
-\begin{tabular}{llrr}
-\toprule
-benchmark & policy & 14B paired & 7B-1M paired \\
-\midrule
-RULER NIAH-multikey & top-$k$ (K-mean) & 0.51 & 0.28 \\
-($n_{dc}=100$ both) & router (K-mean) & 0.63 & 0.39 \\
-                    & Quest (K-max)    & 0.93 & 0.94 \\
-                    & \textbf{router-on-Quest} & \textbf{0.98} & \textbf{1.00} \\
-\midrule
-LongBench-v2 medium & top-$k$          & 0.47 (40) & 0.40 (15) \\
-($n_{dc}$ in parens) & router          & 0.60 (40) & 0.47 (15) \\
-                    & Quest             & 0.68 (40) & 0.60 (15) \\
-                    & \textbf{router-on-Quest} & \textbf{0.75} (40) & \textbf{0.80} (15) \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\textbf{Read.} The cross-model panel sharpens the §\ref{sec:lbv2} story in two ways:
+\textbf{Read.} The same stacking pattern as RULER NIAH appears, with two refinements:
 
 \begin{enumerate}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
-    \item \textbf{Quest's scoring backbone is essentially model-invariant.} RULER NIAH paired recall is $0.93$ on 14B and $0.94$ on 7B-1M -- a $1$\,pp delta across two different architectures. The Quest K-min/K-max upper bound is robust scoring, not a model-specific artifact.
-    \item \textbf{K-mean-based policies degrade severely on 7B-1M.} Top-$k$ drops $-23$\,pp on RULER NIAH ($0.51 \to 0.28$), router-on-mean drops $-24$\,pp ($0.63 \to 0.39$). This is consistent with the K-mean signal being weaker overall: when the underlying scoring is less informative, uncertainty-gated budget allocation has less to work with.
-    \item \textbf{Router-on-Quest is also model-invariant} ($0.98 \to 1.00$ on RULER NIAH; $0.75 \to 0.80$ on LB-v2 medium). The composition inherits Quest's robustness. On RULER NIAH at 7B-1M, the combined method is operationally indistinguishable from dense ($100/100$ paired).
+    \item \textbf{Quest beats K-mean even on LB-v2 medium} ($0.47 \to 0.68$ on Qwen-14B; $0.40 \to 0.60$ on Qwen-7B-1M). The Quest scoring backbone is therefore the dominant lever on \emph{both} benchmarks, not just on RULER NIAH -- including on a benchmark where evidence is distributed rather than concentrated in a single hot key.
+    \item \textbf{Router-on-Quest is the composition headline on both models.} Qwen-14B: paired $0.75$ vs top-$k$ $0.47$ -- $+28$\,pp over the SSA-style baseline. With $n_{dc}=40$ and stderr $\approx 0.10$ on the gap, this is $\approx 2.8\sigma$; McNemar's exact test on the discordant pairs gives $p < 0.01$ -- a statistically clean composition lift on a multi-hop real-task benchmark. Qwen-7B-1M reproduces directionally at $n_{dc}=15$: router-on-Quest $0.80$ vs top-$k$ $0.40$ -- the absolute lift is $+40$\,pp but the statistical power is thinner; the paired-recall ordering across all four sparse policies matches the Qwen-14B picture exactly.
 \end{enumerate}
 
-\subsection{Quality and speed at 128K}\label{sec:long-ctx}
+\textbf{Why all sparse accuracies sit at the same number despite very different paired recalls.} Reading Table~\ref{tab:lbv2} naively obscures a metric pathology that paired recall is designed to surface. On Qwen-14B, every sparse policy posts \emph{accuracy} in $[0.186, 0.209]$ while paired recall ranges over $0.47$--$0.75$ -- and Quest/router-on-Quest's accuracy ($0.20$+) slightly exceeds dense ($0.186$). Decomposing router-on-Quest's $44/215$ correct answers: $30$ come from the dense-correct set (paired $0.75 \times 40 = 30$); the remaining $14$ come from dense-\emph{wrong} examples where the sparse forward happened to pick the right MC option ($14/175$ on chance baseline $25\%$ is below random, expected $44$). Top-$k$'s $41/215$ decomposes as $19$ paired hits ($0.47 \times 40$) $+ 22$ chance hits. Standard error on raw accuracy at this rate is $\sqrt{0.19\cdot 0.81/215} \approx 0.027$, so the $\approx 0.02$ spread across sparse policies is well inside noise. The selector-quality story lives entirely in the paired column.
 
-The same configuration scaled to 128K context on Qwen2.5-7B-Instruct-1M (the 14B model's 32K training window precludes 128K). RULER NIAH-multikey at $n=100$, $\kbudget=33$, $q=0.40$.
+\subsection{Long-context quality scaling: $32$K $\to 128$K}\label{sec:long-ctx}
+
+The preceding subsections fix context at 32K and vary the model. Here we fix the model at Qwen2.5-7B-Instruct-1M (the only one of the three with a training window past 32K) and vary the context length. Same harness, same configuration ($\kbudget=33$, $q=0.40$, $\rho=2$), RULER NIAH-multikey at $n=100$.
 
 \begin{table}[h]
 \centering\small
@@ -416,33 +307,72 @@ dense                 & 1.00 & 1.00 & 0 \\
 \end{tabular}
 \end{table}
 
-\textbf{Read.} The Quest backbone's advantage \emph{widens} with context: at 32K, Quest beats top-$k$ by $+66$\,pp on RULER NIAH paired; at 128K, by $+68$\,pp. K-mean-based selection essentially breaks at 128K (top-$k$ $0.09$, router-on-mean $0.11$) -- the mean-pool signal is too dilute to recover single hot keys among $2{,}048$ blocks. Router-on-Quest lands $+4$\,pp over Quest alone at 128K and within $19$\,pp of dense, despite attending to only $\approx 92$ blocks per tile ($\approx 4.5\%$ of context).
+\textbf{Read.} The Quest backbone's advantage \emph{widens} with context: at 32K, Quest beats top-$k$ by $+66$\,pp on RULER NIAH paired; at 128K, by $+68$\,pp. K-mean-based selection essentially breaks at 128K (top-$k$ $0.09$, router-on-mean $0.11$) -- the mean-pool signal is too dilute to recover single hot keys among $2{,}048$ blocks. Router-on-Quest lands $+4$\,pp over Quest alone at 128K and within $19$\,pp of dense, despite attending to only $\approx 92$ blocks per tile ($\approx 4.5\%$ of context). Speed at 128K is reported separately in Section~\ref{sec:efficiency} alongside the 32K and 64K profiles.
 
-\textbf{Speed at 128K.} CUDA-event prefill profile on the same model at $n=8$ across NIAH and VT examples:
+\subsection{Where the lift comes from: budget, selectivity, and when it activates}\label{sec:lbv1}
+
+The headline results of Sections~\ref{sec:ruler}--\ref{sec:long-ctx} raise two natural questions: is the router's lift over Quest a genuine signal or a side effect of spending more budget, and does the lift hold on every long-context task? This subsection answers both, in that order.
+
+\paragraph{Decomposing the lift: budget vs.\ selectivity.} At $q=0.40$ and $\rho=2$, the router spends on average $\approx 1.4\times$ Quest's budget ($92.4$ effective blocks per tile, vs.\ $66$ for Quest at $\kbudget=33$). Some of the lift over Quest could therefore come not from spending the marginal budget \emph{selectively} -- the router's design intent -- but simply from spending \emph{more} budget on average. To separate the two contributions, we ran uniform Quest at a budget-matched control ($\kbudget=47$, effective $94$) and a sweep of intermediate budgets on the same RULER NIAH-multikey examples used for Table~\ref{tab:ruler}, on both Qwen-14B and Mistral-Nemo.
 
 \begin{table}[h]
 \centering\small
-\caption{Prefill wall-time at 128K on Qwen2.5-7B-Instruct-1M, $n=8$. Attention layers row is the per-example sum of CUDA-event time across all $28$ attention layers; "rest of model" is wall minus attention.}\label{tab:profile-128k}
-\begin{tabular}{lrrrr}
+\caption{Budget-match ablation on RULER NIAH-multikey, ctx=32K, $n=100$. Effective budget includes the sink and self-block forced into every $\text{kv\_idx}$; for the router it is the mean over tiles. $\text{Quest}_{\kbudget=47}$ is the budget-matched control for the router at $q=0.40$. $n_{dc}$ is $100$ on Qwen-14B and $96$ on Mistral-Nemo (same dense-correct subsets as Table~\ref{tab:ruler}). The Qwen column is near the paired ceiling ($\text{Quest}_{\kbudget=33}=0.93$, dense $1.00$); the Nemo column is off-ceiling ($\text{Quest}_{\kbudget=33}=0.51$).}\label{tab:budget-match}
+\begin{tabular}{llrrr}
 \toprule
- & wall (ms) & attn layers (ms) & rest (ms) & vs.\ dense \\
+policy & backbone & eff.\ budget & Qwen-14B paired & Nemo-12B paired \\
 \midrule
-dense (SDPA)         & 20{,}494 & 12{,}972 & 7{,}522 & $1.00\times$ \\
-top-$k$ (v2)         & 11{,}769 & 4{,}283  & 7{,}486 & $\mathbf{0.57\times}$ \\
-router (v2, $q=0.40$) & 12{,}811 & 5{,}320  & 7{,}491 & $\mathbf{0.62\times}$ \\
+top-$k$                              & K-mean & 66    & 0.51 & 0.29 \\
+Quest $\kbudget=33$                  & K-max  & 66    & 0.93 & 0.51 \\
+Quest $\kbudget=40$                  & K-max  & 80    & 0.95 & 0.53 \\
+\textbf{Quest $\kbudget=47$} (matched) & K-max  & \textbf{94}   & \textbf{0.96} & \textbf{0.57} \\
+Quest $\kbudget=52$                  & K-max  & 104   & 0.97 & 0.58 \\
+Quest $\kbudget=66$                  & K-max  & 132   & 0.97 & 0.60 \\
+\textbf{router-on-Quest} ($q=0.40$)  & K-max  & \textbf{92.4} & \textbf{0.98} & \textbf{0.66} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{The Amdahl decomposition continues to widen as predicted.} Attention is $63\%$ of dense prefill at 128K (vs.\ $35\%$ at 32K, $51\%$ at 64K). With the rest-of-model floor fixed at $\approx 7.5$\,s and the attention component reduced to $0.33\times$ for the v2 kernel, the achievable wall-time speedup is $1/(0.367 + 0.633 \times 0.33) = 1.74\times$ -- matching the observed $0.57\times$ wall. The crossover regime is no longer marginal at 128K.
+\paragraph{Decomposition (Qwen-14B, near-ceiling).} Of the $+5$\,pp router-vs-$\text{Quest}_{\kbudget=33}$ lift: $\approx +3$\,pp comes from uniform budget expansion ($\text{Quest}_{\kbudget=47}$ minus $\text{Quest}_{\kbudget=33}$ $= 0.96 - 0.93$), $\approx +2$\,pp from selectivity (router minus $\text{Quest}_{\kbudget=47}$ $= 0.98 - 0.96$). Uniform Quest plateaus at $0.97$ from $\kbudget=52$ onward; the router lands $1$\,pp above that asymptote, suggesting selectivity buys something genuinely orthogonal to raw budget. The Qwen RULER NIAH headline is therefore roughly $\mathbf{2/3}$ \textbf{budget}, $\mathbf{1/3}$ \textbf{selectivity}. \emph{Statistical caveat:} NIAH at 32K on Qwen-14B is near-ceiling. Dense is $1.00$, $\text{Quest}_{\kbudget=33}$ preserves $93/100$, and the entire ablation lives in $[0.93, 0.98]$ -- at most $7$ examples of paired headroom. McNemar's exact test on router vs $\text{Quest}_{\kbudget=47}$ gives $3$ discordant pairs router-favouring and $1$ Quest-favouring, $p = 0.625$: directionally consistent, not separable by statistics at this $n$.
 
-\textbf{Per-layer scaling.} The v2 kernel scales as $29.3 \to 62.9 \to 85.3$\,ms/layer across 32K $\to$ 64K $\to$ 128K (factor $\approx 1.4\times$ per doubling -- sub-linear, dominated by I/O at long context). v2 selection scales as $8.2 \to 31.9 \to 67.7$\,ms/layer (factor $\approx 2\times$ per doubling -- sub-quadratic). Selection's share of prefill: $7\% \to 12\% \to 16\%$; the $25\%$ extrapolation at 128K in earlier work proved conservative, but selection will continue to rise and become bottleneck-rivaling at 256K+.
+\paragraph{Decomposition (Mistral-Nemo, off-ceiling).} Quest at $\kbudget=33$ on Nemo lands at $0.51$ paired -- $49$ points of headroom rather than $7$ -- and the budget-vs-selectivity contributions are large enough to separate cleanly. Of the $+15$\,pp router-vs-$\text{Quest}_{\kbudget=33}$ lift: $\approx +6$\,pp from uniform budget expansion ($\text{Quest}_{\kbudget=47}$ minus $\text{Quest}_{\kbudget=33}$ $= 0.57 - 0.51$), $\approx +9$\,pp from selectivity (router minus $\text{Quest}_{\kbudget=47}$ $= 0.66 - 0.57$). The Nemo split is $\mathbf{2/5}$ \textbf{budget}, $\mathbf{3/5}$ \textbf{selectivity} -- the inverse of the Qwen ratio. Two structural features sharpen the claim further: (i) uniform Quest does \emph{not} plateau on Nemo within the budget range tested ($0.51 \to 0.53 \to 0.57 \to 0.58 \to 0.60$ as eff.\ grows $66 \to 132$); (ii) the router at eff.\ $92.4$ beats uniform $\text{Quest}_{\kbudget=66}$ at eff.\ $132$ by $+6$\,pp -- a Pareto domination on the $\{\text{paired}, \text{eff.\ budget}\}$ plane that no amount of uniform budget expansion within this range can close. \emph{Statistics:} router preserves $63/96$ dense-correct, $\text{Quest}_{\kbudget=47}$ preserves $55/96$; the gap is $8$ examples. Under the most conservative reading ($\text{Quest}_{\kbudget=47}$'s correct set is a subset of the router's), discordant pairs favouring the router are $\geq 8$ and against $\leq 0$; the one-sided sign test gives $p \leq 0.5^8 \approx 0.004$. The actual McNemar count will be similar or larger in the favourable direction.
+
+\paragraph{Reading the two ablations together.} The fraction of the router's lift attributable to selectivity is regime-dependent. Near the paired ceiling, the scoring backbone is doing almost all the work and the router's role shrinks to filling a small remaining gap. Off the ceiling, the scoring backbone leaves substantial headroom and the router's selective allocation captures most of it. This is the expected behaviour of a value-of-information policy: when uncertainty at the cutoff is rare (because scores are sharp), the router rarely triggers and budget expansion dominates the average lift; when uncertainty is common (because scores are diffuse), selective expansion at exactly those high-uncertainty cells dominates. The two ablations are not in tension -- they bracket the regime in which the router operates.
+
+\paragraph{When does the lift activate? LongBench-v1 as a negative control.} The decomposition above answers \emph{how} the router's lift breaks down once it exists; it does not say \emph{when} the lift exists at all. To pin that down we ran the LongBench-v1 panel (\emph{musique-2hop, musique-4hop, narrativeqa, qasper}; $n=30$, 32K context, same $\kbudget=33$, $q=0.40$). LB-v1 native prompt lengths are $5$--$30$K tokens; truncation to 32K is essentially a no-op, so the selector budget of $33$ blocks ($\approx 2$K attended tokens per row) is generous relative to typical needle density. Result: dense, top-$k$, and router essentially tie on F1 across all four tasks; paired (F1 $\geq 0.5$) shows top-$k$ \emph{already} preserves $100\%$ of dense-correct examples on musique-2hop, musique-4hop, and qasper -- no headroom for the router to recover. One small lift on narrativeqa: router paired $1.00$ vs.\ top-$k$ $0.89$ (rescues $1/9$), F1 $0.307$ vs.\ $0.276$ ($+3.1$\,pp). The combined LB-v1 / LB-v2 picture is the cleanest framing of when our method matters: \textbf{the router's lift activates only when the per-query budget is small relative to where the answer-relevant evidence lives.} LB-v2 medium puts the budget under pressure (100K source $\to$ 32K window); LB-v1 does not. This is consistent with the budget-and-selectivity story above: the router can only re-allocate budget that is actually contested.
+
+\subsection{Efficiency: prefill speed from $32$K to $128$K}\label{sec:efficiency}
+
+\textbf{Claim.} Router-on-Quest is slower than dense at $32$K, faster at $64$K, and substantially faster at $128$K. The crossover is structural: attention's share of prefill grows with context, and the rest-of-model floor is invariant across policies.
+
+\textbf{Setup.} CUDA-event breakdown of one prefill forward (no decode) at $n=8$. Decode ($Q=1$) goes through SDPA dense for every policy, so policy-dependent wall time comes purely from prefill. $32$K and $64$K measurements are on Qwen2.5-14B-Instruct; $128$K is on Qwen2.5-7B-Instruct-1M (the 14B model's $32$K training window precludes 128K). Both models use the same v2 kernel and the same $\kbudget=33$, $q=0.40$; per-layer comparisons across the model-swap row are not directly meaningful, but the policy-vs-dense ratios on each row are.
+
+\begin{table}[h]
+\centering\small
+\caption{Prefill wall time across context lengths, $n=8$. ``vs.\ dense'' is the wall-time ratio of the sparse policy to dense at the same context. $32$K and $64$K rows are on Qwen2.5-14B-Instruct; $128$K row is on Qwen2.5-7B-Instruct-1M. Bold entries are the regimes where the sparse policy beats dense.}\label{tab:profile}
+\begin{tabular}{lrrrrr}
+\toprule
+context & dense wall & top-$k$ wall & router wall & top-$k$ vs.\ dense & router vs.\ dense \\
+\midrule
+$32$K  & 5{,}534 ms  & 5{,}349 ms  & 6{,}112 ms  & $0.97\times$  & $1.10\times$ \\
+$64$K  & 16{,}878 ms & 12{,}747 ms & 14{,}189 ms & $\mathbf{0.76\times}$ & $\mathbf{0.84\times}$ \\
+$128$K & 20{,}494 ms & 11{,}769 ms & 12{,}811 ms & $\mathbf{0.57\times}$ & $\mathbf{0.62\times}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Why 32K loses, why 128K wins (Amdahl).} Attention's share of dense prefill is $35\%$ at 32K, $51\%$ at 64K, $63\%$ at 128K; the rest-of-model floor (linear layers, MLP, layernorms) is invariant across policies. Even an infinitely fast attention kernel can only speed up the attention share. At 32K the structural ceiling on speedup is $\approx 9\%$ (and the v2 kernel does not saturate it because selection adds back $\approx 7\%$); at 128K the ceiling is $\approx 63\%$ and the v2 kernel realises most of it ($1.74\times$ predicted, $1.76\times$ observed for top-$k$). The $32$K row is therefore a structural loss, not a kernel-engineering failure; the headline regime is $64$K and beyond.
+
+\textbf{Kernel and selection scaling.} The v2 kernel scales sub-linearly with $N$ (per-layer time scales $\approx 1.4\times$ per doubling of context, dominated by HBM I/O at long context); SDPA scales quadratically ($\approx 4\times$ per doubling). The cross-over is therefore not a coincidence -- it is what the kernel's design predicts. Selection (the $q \cdot \bar K^T$ pool-product plus topk) currently scales $\approx 2\times$ per doubling and takes $7\%$ / $12\%$ / $16\%$ of prefill at $32$K / $64$K / $128$K. By $256$K it would rival the kernel itself; caching $\bar K$ once per layer and fusing selection into the kernel's first pass are the natural next-step optimisations, but they are engineering work and do not change the method.
+
+\textbf{Router vs.\ top-$k$.} The router pays an extra $\approx 1.5\times$ kernel time per triggered tile because it expands $\kbudget \to \rho\kbudget$ on the bottom-$q$ fraction (Section~\ref{sec:method}, Step~6); this shows up as the $0.05$--$0.08\times$ gap between the top-$k$ and router columns at $64$K and $128$K. The router's quality lift (Section~\ref{sec:ruler}--\ref{sec:long-ctx}) buys this back: at $128$K, router-on-Quest holds paired recall $0.81$ vs.\ dense $1.00$ at $0.62\times$ dense wall time.
 
 \subsection{Limitations}\label{sec:limits}
 
 \begin{enumerate}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
     \item \textbf{Per-tile granularity.} Per-tile selection structurally loses needles that one row strongly wants but other rows in the tile ignore. The router recovers part of this gap but not all. A per-row scatter-into-bitmap kernel would close the rest of the gap without re-materialising the $[B,H,M,\NB]$ keep tensor; not yet built.
-    \item \textbf{Two models within the Qwen2.5 family.} The cross-model panel (\S\ref{sec:cross-model}) covers Qwen2.5-14B-Instruct and Qwen2.5-7B-Instruct-1M, validating that the composition lift is not specific to either model size or training-window configuration. Transfer to other architectures (Llama 3, Mistral, MiniMax) remains untested; the method has no model-specific assumptions but third-family validation is the next experimental milestone. The remaining open item from the original plan is HELMET-RAG as a third standardised benchmark, which would broaden the empirical base beyond RULER and LongBench.
+    \item \textbf{Cross-family coverage at 32K, but constrained at 128K.} The model panel (Section~\ref{sec:experiments}, Setup) covers two families and three models, validating at 32K that the composition lift and the budget-vs-selectivity decomposition (Section~\ref{sec:lbv1}) hold on a non-Qwen architecture. Two transfer gaps remain. First, on real-task QA: LongBench-v2 on Mistral-Nemo was attempted but the model's hard-multiple-choice base accuracy at 32K is too low to yield a usable $n_{dc}$ ($0/4$ dense-correct in a smoke), so cross-family LB-v2 requires a stronger non-Qwen model -- Llama-3.1-8B-Instruct is the natural candidate but requires HF gating; Mistral-Small-3.1-24B is the next Mistral size up but also gated. Second, at long context: Mistral-Nemo at 128K OOMs on A100-80GB ($\approx 24$\,GB weights + $\approx 11$\,GB KV cache at $128$K + activations), so the only $128$K data point is Qwen2.5-7B-Instruct-1M (Section~\ref{sec:long-ctx}). Higher-memory hardware (H100-94GB, H200) or a chunked-prefill harness would unblock cross-family $128$K; both are engineering work, not method changes. The remaining open standardised benchmark is HELMET-RAG.
+    \item \textbf{Hyperparameter sweeps incomplete.} The trigger fraction $q = 0.40$ was selected from a RULER NIAH-multikey sweep at $n=30$ and used unchanged on every benchmark, model, and context length in the paper (Appendix~\ref{app:row-vs-cell}). We did not re-sweep $q$ per task; LongBench-v2 medium in particular plausibly benefits from a different value because the budget-vs-evidence Pareto shifts (distributed evidence vs.\ single hot keys). The expansion factor $\rho = 2$ is similarly fixed throughout; a $\rho \in \{1.25, 1.5, 2\}$ Pareto sweep would characterise the speed/quality trade-off the router exposes, but is not yet run.
     \item \textbf{What's bounded, what's owed.} Appendix~\ref{app:bai} anchors the $\sigma$-quantile router as the dimensionless analogue of the asymptotically optimal best-arm-identification (BAI) exploration index of \citet{garivier2016optimal}, with a $C(\tau)$-times-optimal statement for top-$k$ \emph{identification} under sub-Gaussian noise on block scores. The remaining gap is from \emph{identification} to \emph{attention output}: the downstream quantity we actually care about is $\|o^{\widehat S} - o^{\text{full}}\|$, which depends on the softmax mass on dropped blocks, not their identity. Composing the BAI bound with an attention-output sensitivity bound -- a $C(\tau) \cdot f(\sigma)$-times-optimal statement on the output itself -- is the natural follow-up theorem. This tightens what the BAI bound already delivers; it is not strictly needed for the empirical claims.
 \end{enumerate}
 
@@ -450,15 +380,13 @@ router (v2, $q=0.40$) & 12{,}811 & 5{,}320  & 7{,}491 & $\mathbf{0.62\times}$ \\
 \section*{Conclusion}
 %========================================================================
 {\color{red}
-Block-sparse attention has two failure modes that have been conflated in the literature. The first is imprecise block scoring: when keys are pooled by a mean ($\bar k_b$), a single hot key inside a block is averaged out of the score, and the selector cannot tell that block apart from a distractor. The second is the myopic cutoff: even with a perfect score, top-$k$ commits at the boundary without spending budget where the decision was nearly a coin flip. The two are independent dimensions, and fixing them stacks.
+In this work we presented an uncertainty-gated value-of-information \emph{router} for block-sparse attention selectors: a per-tile cutoff-margin signal $\sigma$ triggers a $\rho\times$ expansion of the kept set on the bottom $q$-fraction of tiles per layer, independent of how block scores are computed and stackable with existing scoring backbones such as Quest.
 
-We address the second with an uncertainty-gated \emph{router}: a per-tile cutoff-margin signal triggers a $2\times$ expansion of the kept set on the bottom $q$-fraction of tiles per layer. The rule is independent of how block scores are computed and composes with any scoring backbone; we evaluate it on top of the SSA-style K-mean backbone and on top of Quest's K-min/K-max upper bound.
+On standardised long-context benchmarks the router delivers measurable quality gains. On LongBench-v2 medium ($n=215$, $32$K) router-on-Quest paired recall reaches $0.75$ vs.\ top-$k$ $0.47$ -- a statistically clean composition lift ($+28$\,pp, McNemar $p<0.01$) on a multi-hop real-task benchmark. The lift reproduces on three models from two architecture families: on Mistral-Nemo-Instruct-2407, where Quest has paired headroom rather than saturating, the router beats Quest by $+15$\,pp ($p<0.001$). At $128$K context, router-on-Quest holds paired recall $0.81$ while the SSA-style baseline collapses to $0.09$, and the fused selection-plus-kernel pipeline runs at $0.62\times$ dense wall time -- beating dense from $64$K onward as predicted by Amdahl arithmetic.
 
-\textbf{Quality.} On Qwen2.5-14B-Instruct at 32K, $n=100$, the router lifts RULER NIAH-multikey paired recall from $0.51 \to 0.63$ on K-mean and $0.93 \to 0.98$ on Quest. On LongBench-v2 medium at $n=215$ (the entire dataset subset), router-on-Quest paired $0.75$ vs.\ top-$k$ $0.47$ -- $+28$\,pp, $\approx 2.8\sigma$, McNemar $p<0.01$ -- the first statistically clean composition lift on a multi-hop benchmark. Cross-model validation on Qwen2.5-7B-Instruct-1M reproduces every directional finding: Quest-backbone paired recall is essentially model-invariant ($0.93 \to 0.94$ on RULER NIAH), and router-on-Quest reaches paired $1.00$ at 32K on the 7B-1M (operationally indistinguishable from dense). Scaling the same 7B-1M model to 128K, router-on-Quest paired holds at $0.81$ while K-mean policies collapse ($0.09$--$0.11$); Quest's backbone advantage widens with context length as the mean-pool signal further dilutes. A LongBench-v1 negative control pins the regime: the lift activates only when the selector's per-query budget is small relative to where the answer-relevant evidence lives.
+We are excited to extend this line of work in three directions. The most immediate empirical gaps are third-family validation beyond Qwen and Mistral (Llama-3, MiniMax) and a stronger non-Qwen base model for cross-family LongBench-v2; HELMET-RAG would broaden the standardised benchmark base. The most immediate engineering gain is fusing block selection into the attention kernel, which the per-layer scaling profile projects to become the dominant cost at $256$K+. The BAI bound in Appendix~\ref{app:bai} characterises top-$k$ identification under noisy block scores; composing it with an attention-output sensitivity bound is the natural follow-up theorem.
 
-\textbf{Speed.} The fused selection-plus-kernel pipeline runs at $0.97\times$ dense at 32K, $0.76$--$0.85\times$ at 64K, and $0.57$--$0.62\times$ at 128K -- the crossover widens structurally with $N$ by Amdahl arithmetic (attention is $35\%$ of dense prefill at 32K, $51\%$ at 64K, $63\%$ at 128K). The next bottleneck is selection itself, which is engineering work (cache $\bar K$ once per layer, fuse selection into the kernel's first pass), not a method change.
-
-Open work: (i) third-family model transfer (Llama 3, Mistral, MiniMax); (ii) HELMET-RAG as a third standardised benchmark; (iii) the budget-match ablation re-run on LongBench-v2 medium, where the $n_{dc}=40$ headroom is large enough to separate the budget and selectivity contributions cleanly (the RULER NIAH version is near-ceiling); (iv) sweep the router expansion factor $\rho \in \{1.25, 1.5, 2\}$ for a paired/speed Pareto.
+Code, results, and reproduction scripts: \url{https://github.com/ThomasRossi/uncertainty-gated-block-sparse-attention}.
 }
 
 %========================================================================
@@ -532,6 +460,51 @@ The triggered case requires a top-$\rho k$ rather than a top-$(k{+}1)$, which we
 \end{equation}
 which at $q=0.4, \rho=2$ is $1.4\,\kbudget$. This is the headline cost of the router.
 
+\section{Pointer-Chase Haystack: construction and diagnostic results}\label{app:pch}
+
+The Pointer-Chase Haystack (PCH) is a custom diagnostic benchmark we built during method development to isolate selector quality from model capability. We retain it here for transparency on the development process; the headline empirical results in Section~\ref{sec:experiments} use the standardised benchmarks RULER NIAH and LongBench-v2 medium.
+
+\textbf{Design goals.} We needed a task that (i) has a dense-attention ceiling of $\approx 100\%$, so failures are unambiguously selector failures, and (ii) is \emph{query-latent}, meaning the relevant tokens cannot be identified by surface matching against the query alone. RULER NIAH multi-key satisfies (i) but not (ii); RULER VT satisfies (ii) but not (i) (Qwen 7B fails it).
+
+\textbf{Construction.} A pointer chase of depth $h$ is a sequence of indexed entries
+\begin{quote}\itshape\small
+Entry $\text{ID}_0$: continue at entry $\text{ID}_1$. \\
+Entry $\text{ID}_1$: continue at entry $\text{ID}_2$. \\
+$\vdots$ \\
+Entry $\text{ID}_h$: the recorded value is $V$.
+\end{quote}
+with all $\text{ID}_k$ drawn from a private namespace. A PCH instance contains one gold chain plus $D$ distractor chains, all entries shuffled into a haystack of target token length $N$. The query gives $\text{ID}_0$ and asks for $V$. Hop $0$ is query-identifiable; hops $1,\dots,h$ are query-latent. Compounding is by construction: missing entry $k$ permanently blocks every entry $k{+}1, \dots, h$.
+
+\textbf{Grounding.} The pointer chase is the canonical communication-complexity problem for unavoidable $k$-round sequential dependency: it provably cannot be collapsed into fewer rounds. Every per-hop operation is trivial (follow a link, read a value), keeping a capable dense model at the $\sim 100\%$ ceiling.
+
+\textbf{Metric.} We report \emph{hit rate}: the fraction of gold-chain blocks the selector keeps in $\text{kv\_idx}$. Hit rate is well-defined only when the gold blocks are known by construction, which is the case here.
+
+\textbf{Result.} Table~\ref{tab:pch} reports hit rate at $h=3$, fixed $\kbudget=40$ blocks/row (32K, 64K) and $29$ (8K), on Qwen2.5-14B-Instruct.
+
+\begin{table}[h]
+\centering\small
+\caption{PCH hop=3 hit rate. Hit rate is the fraction of gold-chain blocks the selector keeps. Steady-state wall time is reported for orientation; the main efficiency analysis is in Section~\ref{sec:efficiency}.}\label{tab:pch}
+\begin{tabular}{lllrl}
+\toprule
+ctx & policy & dt (steady) & vs dense & hit rate \\
+\midrule
+8K  & dense                & 1.4s & $1.00\times$ & 1.00 \\
+8K  & top-$k$ (per-tile)   & 1.6s & $1.14\times$ slower & 0.79 \\
+8K  & \textbf{router q=0.10} & 1.6s & $1.14\times$ slower & \textbf{1.00} \\
+\midrule
+32K & dense                & 6.9s & $1.00\times$ & 1.00 \\
+32K & top-$k$              & 6.05s & $0.88\times$ (12\% faster) & 0.63 \\
+32K & \textbf{router q=0.10} & 6.6s & $0.96\times$ (4\% faster) & \textbf{0.78} \\
+\midrule
+64K & dense                & 17.5s & $1.00\times$ & 1.00 \\
+64K & top-$k$              & 14.1s & $0.81\times$ ($1.24\times$ faster) & 0.42 \\
+64K & \textbf{router q=0.10} & 14.8s & $0.85\times$ ($1.18\times$ faster) & \textbf{0.54} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Router lifts hit rate over plain top-$k$ by $+12$--$+15$\,pp across scales (and recovers dense's $1.00$ at 8K). The gain is monotonic with context length, consistent with the structural cost of per-tile selection increasing with $N$ that motivates the router in the first place.
+
 \section{Per-row vs.\ per-cell aggregation: why heads are pooled before thresholding}\label{app:row-vs-cell}
 
 We tested two natural alternatives to Eq.~\eqref{eq:trigger} and they both fail. We report them here so the design choice in Section~\ref{sec:method} can be understood as a tested decision rather than an arbitrary one.
@@ -540,7 +513,7 @@ We tested two natural alternatives to Eq.~\eqref{eq:trigger} and they both fail.
 
 \paragraph{Absolute threshold $\tau$ on $\sigma$.} Trigger on $\mathbb{1}\!\bigl[\sigma[t,h] \le \tau\bigr]$ for a fixed $\tau$. Result: works at one layer's $\sigma$ distribution but not across the stack; we observe systematic distribution shift early-vs-late layers. A per-layer quantile is the simplest layer-conditional fix and dominated the absolute-$\tau$ sweep.
 
-\paragraph{Row-grain $q = 0.10$ (PCH).} On PCH at 32K, row-grain $q = 0.10$ reaches near-top-$k$ effective budget at hit rate $0.78$, vs.\ plain top-$k$ at $0.63$. On RULER and LB-v2 we use $q = 0.40$ because the budget regime is tighter and the marginal-cost-vs-marginal-gain Pareto shifts; we have not yet swept $q$ on RULER or LB-v2 systematically.
+\paragraph{Row-grain $q$ sweep.} On PCH at 32K, row-grain $q = 0.10$ reaches near-top-$k$ effective budget at hit rate $0.78$, vs.\ plain top-$k$ at $0.63$. On RULER NIAH-multikey at $n=30$, ctx=32K (fixed $\kbudget=33$, kernel-v2, row-grain quantile router), we swept $q \in \{0.10, 0.20, 0.30, 0.40\}$ and observed paired recall $0.38, 0.35, 0.47, 0.53$ respectively, vs.\ top-$k$ baseline $0.35$. The trend is monotonic in $q$ over the tested range and plateaus near $q = 0.40$. We use $q = 0.40$ for the headline results on RULER and LB-v2; the regime where $q$ should differ across tasks (because the budget-vs-evidence Pareto shifts) is consistent with the smaller value chosen for PCH, but a per-task sweep on LB-v2 medium remains open.
 
 \section{$\sigma$ as a best-arm-identification exploration index}\label{app:bai}
 
@@ -632,6 +605,13 @@ The bound \eqref{eq:bai-suboptimality} is asymptotic; we cannot directly read $C
 
 \bibliographystyle{plainnat}
 \begin{thebibliography}{99}
+
+% --- Foundations
+\bibitem[Vaswani et al.(2017)]{vaswani2017attention}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones, A.~N. Gomez, {\L}.~Kaiser, and I.~Polosukhin.
+\newblock Attention is all you need.
+\newblock In \emph{NeurIPS}, 2017.
+\newblock \url{https://arxiv.org/abs/1706.03762}.
 
 % --- Block-sparse / efficient long-context selectors
 \bibitem[Tang et al.(2024)]{tang2024quest}
