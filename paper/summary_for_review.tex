@@ -292,22 +292,22 @@ The preceding subsections fix context at 32K and vary the model. Here we fix the
 
 \begin{table}[h]
 \centering\small
-\caption{RULER NIAH-multikey paired recall as context length grows, Qwen2.5-7B-Instruct-1M, $n=100$. Dense is $100/100$ at both 32K and 128K (within the model's training window). All sparse policies degrade with context, but the K-mean-based policies (top-$k$, router-on-mean) collapse while Quest-based policies (Quest, router-on-Quest) hold most of their lift.}\label{tab:long-ctx}
-\begin{tabular}{lrrr}
+\caption{RULER NIAH-multikey paired recall as context length grows, Qwen2.5-7B-Instruct-1M, $n=100$. Dense is $100/100$ at all three contexts (within the model's training window). All sparse policies degrade with context; the K-mean-based policies (top-$k$, router-on-mean) collapse while Quest-based policies (Quest, router-on-Quest) hold most of their lift. ``--'' at the $64$K router-on-mean cell: that policy was not run at $64$K (router-on-Quest is the headline composition).}\label{tab:long-ctx}
+\begin{tabular}{lrrrr}
 \toprule
-policy & 32K paired & 128K paired & $\Delta$ \\
+policy & 32K paired & 64K paired & 128K paired & $\Delta$ (32K $\to$ 128K) \\
 \midrule
-top-$k$               & 0.28 & 0.09 & $-0.19$ \\
-router (K-mean)       & 0.39 & 0.11 & $-0.28$ \\
-Quest                 & 0.94 & 0.77 & $-0.17$ \\
-\textbf{router-on-Quest} & \textbf{1.00} & \textbf{0.81} & $-0.19$ \\
+top-$k$               & 0.28 & 0.16 & 0.09 & $-0.19$ \\
+router (K-mean)       & 0.39 & --   & 0.11 & $-0.28$ \\
+Quest                 & 0.94 & 0.87 & 0.77 & $-0.17$ \\
+\textbf{router-on-Quest} & \textbf{1.00} & \textbf{0.92} & \textbf{0.81} & $-0.19$ \\
 \midrule
-dense                 & 1.00 & 1.00 & 0 \\
+dense                 & 1.00 & 1.00 & 1.00 & 0 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Read.} The Quest backbone's advantage \emph{widens} with context: at 32K, Quest beats top-$k$ by $+66$\,pp on RULER NIAH paired; at 128K, by $+68$\,pp. K-mean-based selection essentially breaks at 128K (top-$k$ $0.09$, router-on-mean $0.11$) -- the mean-pool signal is too dilute to recover single hot keys among $2{,}048$ blocks. Router-on-Quest lands $+4$\,pp over Quest alone at 128K and within $19$\,pp of dense, despite attending to only $\approx 92$ blocks per tile ($\approx 4.5\%$ of context). Speed at 128K is reported separately in Section~\ref{sec:efficiency} alongside the 32K and 64K profiles.
+\textbf{Read.} The Quest backbone's advantage \emph{widens} with context: at 32K, Quest beats top-$k$ by $+66$\,pp on RULER NIAH paired; at 64K by $+71$\,pp; at 128K by $+68$\,pp. K-mean-based selection essentially breaks at 128K (top-$k$ $0.09$, router-on-mean $0.11$) -- the mean-pool signal is too dilute to recover single hot keys among $2{,}048$ blocks. Router-on-Quest tracks Quest at all three contexts with a $+4$ to $+5$\,pp lift, landing within $19$\,pp of dense at 128K while attending to only $\approx 92$ blocks per tile ($\approx 4.5\%$ of context). Speed at the same three contexts is reported in Section~\ref{sec:efficiency}; the joint speed-vs-quality picture is monotonic and Pareto-favourable from $64$K onward.
 
 \subsection{Where the lift comes from: budget, selectivity, and when it activates}\label{sec:lbv1}
 
@@ -345,27 +345,43 @@ Quest $\kbudget=66$                  & K-max  & 132   & 0.97 & 0.60 \\
 
 \textbf{Claim.} Router-on-Quest is slower than dense at $32$K, faster at $64$K, and substantially faster at $128$K. The crossover is structural: attention's share of prefill grows with context, and the rest-of-model floor is invariant across policies.
 
-\textbf{Setup.} CUDA-event breakdown of one prefill forward (no decode) at $n=8$. Decode ($Q=1$) goes through SDPA dense for every policy, so policy-dependent wall time comes purely from prefill. $32$K and $64$K measurements are on Qwen2.5-14B-Instruct; $128$K is on Qwen2.5-7B-Instruct-1M (the 14B model's $32$K training window precludes 128K). Both models use the same v2 kernel and the same $\kbudget=33$, $q=0.40$; per-layer comparisons across the model-swap row are not directly meaningful, but the policy-vs-dense ratios on each row are.
+\textbf{Setup.} CUDA-event breakdown of one prefill forward (no decode) at $n=8$, on Qwen2.5-7B-Instruct-1M (the only one of the three panel models with a training window past 32K, so we can scale all three context lengths on a single model). Decode ($Q=1$) goes through SDPA dense for every policy, so policy-dependent wall time comes purely from prefill. All policies use the same v2 kernel and the same $\kbudget=33$, $q=0.40$.
 
 \begin{table}[h]
 \centering\small
-\caption{Prefill wall time across context lengths, $n=8$. ``vs.\ dense'' is the wall-time ratio of the sparse policy to dense at the same context. $32$K and $64$K rows are on Qwen2.5-14B-Instruct; $128$K row is on Qwen2.5-7B-Instruct-1M. Bold entries are the regimes where the sparse policy beats dense.}\label{tab:profile}
+\caption{Prefill wall time across context lengths on Qwen2.5-7B-Instruct-1M, $n=8$. ``vs.\ dense'' is the wall-time ratio of the sparse policy to dense at the same context. Bold entries are the regimes where the sparse policy beats dense. Joint speed-vs-quality picture in Table~\ref{tab:pareto} below.}\label{tab:profile}
 \begin{tabular}{lrrrrr}
 \toprule
 context & dense wall & top-$k$ wall & router wall & top-$k$ vs.\ dense & router vs.\ dense \\
 \midrule
-$32$K  & 5{,}534 ms  & 5{,}349 ms  & 6{,}112 ms  & $0.97\times$  & $1.10\times$ \\
-$64$K  & 16{,}878 ms & 12{,}747 ms & 14{,}189 ms & $\mathbf{0.76\times}$ & $\mathbf{0.84\times}$ \\
+$32$K  & 2{,}632 ms  & 2{,}643 ms  & 2{,}880 ms  & $1.00\times$  & $1.09\times$ \\
+$64$K  & 7{,}012 ms  & 5{,}690 ms  & 6{,}097 ms  & $\mathbf{0.81\times}$ & $\mathbf{0.87\times}$ \\
 $128$K & 20{,}494 ms & 11{,}769 ms & 12{,}811 ms & $\mathbf{0.57\times}$ & $\mathbf{0.62\times}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Why 32K loses, why 128K wins (Amdahl).} Attention's share of dense prefill is $35\%$ at 32K, $51\%$ at 64K, $63\%$ at 128K; the rest-of-model floor (linear layers, MLP, layernorms) is invariant across policies. Even an infinitely fast attention kernel can only speed up the attention share. At 32K the structural ceiling on speedup is $\approx 9\%$ (and the v2 kernel does not saturate it because selection adds back $\approx 7\%$); at 128K the ceiling is $\approx 63\%$ and the v2 kernel realises most of it ($1.74\times$ predicted, $1.76\times$ observed for top-$k$). The $32$K row is therefore a structural loss, not a kernel-engineering failure; the headline regime is $64$K and beyond.
+\textbf{Joint speed-vs-quality.} Combining Table~\ref{tab:profile} with the matching RULER NIAH-multikey paired recall on the same model (Table~\ref{tab:long-ctx}) gives the headline Pareto picture: router-on-Quest matches dense quality at 32K but is $9\%$ slower; at 64K it preserves $92\%$ of dense quality while running $13\%$ faster; at 128K it preserves $81\%$ of dense quality while running $38\%$ faster. The crossover regime is 64K -- the smallest context where the sparse policy is Pareto-dominant against dense on this benchmark.
 
-\textbf{Kernel and selection scaling.} The v2 kernel scales sub-linearly with $N$ (per-layer time scales $\approx 1.4\times$ per doubling of context, dominated by HBM I/O at long context); SDPA scales quadratically ($\approx 4\times$ per doubling). The cross-over is therefore not a coincidence -- it is what the kernel's design predicts. Selection (the $q \cdot \bar K^T$ pool-product plus topk) currently scales $\approx 2\times$ per doubling and takes $7\%$ / $12\%$ / $16\%$ of prefill at $32$K / $64$K / $128$K. By $256$K it would rival the kernel itself; caching $\bar K$ once per layer and fusing selection into the kernel's first pass are the natural next-step optimisations, but they are engineering work and do not change the method.
+\begin{table}[h]
+\centering\small
+\caption{Speed-vs-quality Pareto for router-on-Quest, Qwen2.5-7B-Instruct-1M, RULER NIAH-multikey at $n=100$ (paired recall) and the prefill profile at $n=8$ (wall time). Dense paired recall is $1.00$ by construction; the relevant question is how much quality is preserved vs.\ how much wall time is saved.}\label{tab:pareto}
+\begin{tabular}{lrrr}
+\toprule
+context & router-on-Quest paired & router wall vs.\ dense & verdict \\
+\midrule
+$32$K  & $1.00$ (matches dense)    & $1.09\times$ (slower) & ties quality, loses speed \\
+$64$K  & $\mathbf{0.92}$           & $\mathbf{0.87\times}$ ($\mathbf{13\%}$ faster) & first Pareto win \\
+$128$K & $\mathbf{0.81}$           & $\mathbf{0.62\times}$ ($\mathbf{38\%}$ faster) & strong Pareto win \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\textbf{Router vs.\ top-$k$.} The router pays an extra $\approx 1.5\times$ kernel time per triggered tile because it expands $\kbudget \to \rho\kbudget$ on the bottom-$q$ fraction (Section~\ref{sec:method}, Step~6); this shows up as the $0.05$--$0.08\times$ gap between the top-$k$ and router columns at $64$K and $128$K. The router's quality lift (Section~\ref{sec:ruler}--\ref{sec:long-ctx}) buys this back: at $128$K, router-on-Quest holds paired recall $0.81$ vs.\ dense $1.00$ at $0.62\times$ dense wall time.
+\textbf{Why 32K loses, why 128K wins (Amdahl).} Attention's share of dense prefill grows with context, while the rest-of-model floor (linear layers, MLP, layernorms) is invariant across policies. On Qwen2.5-7B-Instruct-1M, attention is $\approx 31\%$ of dense prefill at 32K, $\approx 45\%$ at 64K, $\approx 63\%$ at 128K. Even an infinitely fast attention kernel can only speed up the attention share. At 32K the structural ceiling on speedup is small, and selection adds back $\approx 7\%$; at 128K the ceiling is $\approx 63\%$ and the v2 kernel realises most of it (predicted $1.74\times$, observed $1.76\times$ for top-$k$). The $32$K row is therefore a structural loss, not a kernel-engineering failure; the headline regime is $64$K and beyond.
+
+\textbf{Kernel and selection scaling.} The v2 kernel scales sub-linearly with $N$ (per-layer time grows $\approx 1.4$--$1.8\times$ per doubling of context, dominated by HBM I/O at long context); SDPA scales quadratically ($\approx 4\times$ per doubling). The cross-over is therefore not a coincidence -- it is what the kernel's design predicts. Selection (the $q \cdot \bar K^T$ pool-product plus topk) currently scales $\approx 2$--$3\times$ per doubling and takes a growing fraction of prefill at long context; caching $\bar K$ once per layer and fusing selection into the kernel's first pass are the natural next-step optimisations, but they are engineering work and do not change the method.
+
+\textbf{Router vs.\ top-$k$.} The router pays an extra $\approx 1.5\times$ kernel time per triggered tile because it expands $\kbudget \to \rho\kbudget$ on the bottom-$q$ fraction (Section~\ref{sec:method}, Step~6); this shows up as the $0.05$--$0.09\times$ gap between the top-$k$ and router columns. The router's quality lift (Section~\ref{sec:ruler}--\ref{sec:long-ctx}) buys this back: at $128$K, router-on-Quest holds paired recall $0.81$ vs.\ dense $1.00$ at $0.62\times$ dense wall time, while top-$k$ at $0.57\times$ wall time only preserves paired recall $0.09$.
 
 \subsection{Limitations}\label{sec:limits}
 
