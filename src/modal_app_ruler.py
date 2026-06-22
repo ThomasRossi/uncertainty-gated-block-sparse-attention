@@ -30,7 +30,7 @@ image = (
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     .add_local_python_source("sparse_attention", "ruler_tasks", "poc_core",
                              "pointer_haystack", "result_cache",
-                             "triton_block_attn")
+                             "triton_block_attn", "dump_block_scores")
 )
 
 cache = modal.Volume.from_name("voi-router-hf-cache", create_if_missing=True)
@@ -78,7 +78,9 @@ def experiment(n_per: int, ctx: int, buckets: list,
                seed: int, kernel_v2: bool,
                code_version: str, dense_code_version: str,
                budget_values: list, budget_sweep_policy: str,
-               model_name: str = MODEL):
+               model_name: str = MODEL,
+               dump_block_scores_path: str = "",
+               no_cache: bool = False):
     import random
 
     import torch
@@ -106,8 +108,22 @@ def experiment(n_per: int, ctx: int, buckets: list,
     sparse_attention.install_rollout_hooks(model)
     print(f"model loaded, gpu={torch.cuda.get_device_name()}", flush=True)
 
-    result_cache = ResultCache("/cache/result_cache.json")
-    print(f"loaded result cache: {len(result_cache)} entries", flush=True)
+    # Diagnostic dump for the BAI/VoI appendix: install AFTER model load, BEFORE
+    # any prefill, so every sparse-selection call is captured. Lives outside the
+    # cache-key file set so existing result_cache entries are not invalidated by
+    # its presence. A diagnostic run additionally bypasses the result_cache
+    # (no_cache=True is implied) because a cache hit short-circuits the forward
+    # and there would be no scores to dump.
+    if dump_block_scores_path:
+        import dump_block_scores as _dbs
+        _dbs.install_dump_hook(dump_block_scores_path)
+        no_cache = True
+
+    result_cache = None if no_cache else ResultCache("/cache/result_cache.json")
+    if result_cache is None:
+        print("result cache: BYPASSED (no_cache=True)", flush=True)
+    else:
+        print(f"loaded result cache: {len(result_cache)} entries", flush=True)
 
     fb = fixed_budget if fixed_budget > 0 else None
     base_pols = [p for p in policies if p != "router"]
@@ -149,8 +165,9 @@ def experiment(n_per: int, ctx: int, buckets: list,
                 print(f"[router {label_knob} {i+1}/{len(examples)}] "
                       f"{task} {kw} recall={r['recall']:.2f} "
                       f"hit={r['hit']:.2f} {r['dt']:.1f}s", flush=True)
-        result_cache.save()
-        cache.commit()
+        if result_cache is not None:
+            result_cache.save()
+            cache.commit()
     # Budget ablation sweep: re-run `budget_sweep_policy` at each budget value
     # so router-at-base vs uniform-at-matched-budget is one JSON away.
     if budget_values and budget_sweep_policy:
@@ -169,9 +186,16 @@ def experiment(n_per: int, ctx: int, buckets: list,
                 print(f"[{label} {i+1}/{len(examples)}] "
                       f"{task} {kw} recall={r['recall']:.2f} "
                       f"hit={r['hit']:.2f} {r['dt']:.1f}s", flush=True)
-        result_cache.save()
+        if result_cache is not None:
+            result_cache.save()
+            cache.commit()
+    if result_cache is not None:
+        print(result_cache.summary(), flush=True)
+
+    if dump_block_scores_path:
+        import dump_block_scores as _dbs
+        _dbs.flush_and_teardown()
         cache.commit()
-    print(result_cache.summary(), flush=True)
 
     result["buckets"] = buckets
     result["ctx"] = ctx
@@ -200,7 +224,9 @@ def main(n_per: int = 2, ctxlen: int = 32768,
          budget_sweep_policy: str = "quest",
          seed: int = 0,
          kernel_v2: bool = True,
-         model: str = MODEL):
+         model: str = MODEL,
+         dump_block_scores: str = "",
+         no_cache: bool = False):
     # RULER smoke: two tasks at the same ctx -- NIAH (single-hop budget
     # contention) and VT (multi-hop chain tracing).
     buckets = [
@@ -223,7 +249,8 @@ def main(n_per: int = 2, ctxlen: int = 32768,
                                router_score,
                                seed, kernel_v2,
                                code_version, dense_code_version,
-                               bud_list, budget_sweep_policy, model)
+                               bud_list, budget_sweep_policy, model,
+                               dump_block_scores, no_cache)
 
     import poc_core
     print("\n" + poc_core.summary_table(buckets, result["rows"]))
