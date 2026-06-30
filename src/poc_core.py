@@ -28,8 +28,38 @@ def make_example(rng, task, kw, ctx):
 
 def locate(tok, ex):
     """Tokenize the templated prompt; return (encoding, gold needle block set)."""
-    text = tok.apply_chat_template([{"role": "user", "content": ex.prompt}],
-                                   add_generation_prompt=True, tokenize=False)
+    # Qwen3+ reasoning models default to enable_thinking=True and emit a
+    # <think>...</think> trace that consumes max_new_tokens before the answer.
+    # Suppress only when the template references the variable; rendered text is
+    # otherwise identical, so non-reasoning model cache keys are preserved.
+    extra = {}
+    uses_thinking = "enable_thinking" in (getattr(tok, "chat_template", None) or "")
+    if uses_thinking:
+        extra["enable_thinking"] = False
+    # MC tasks on chat reasoning models: even with thinking disabled, the model
+    # discursively walks through "Option (A)...", so the first A/B/C/D the
+    # regex hits is not the answer. Bypass via assistant prefill: strip the
+    # trailing "The correct answer is" from the user message, prefill the
+    # assistant turn with "The correct answer is (", and let the model emit
+    # one letter. Gated to reasoning models so non-reasoning cache keys stay
+    # valid.
+    if uses_thinking and getattr(ex, "task", None) == "longbench_v2":
+        marker = "The correct answer is"
+        user_text = ex.prompt.rstrip()
+        if user_text.endswith(marker):
+            user_text = user_text[:-len(marker)].rstrip()
+            text = tok.apply_chat_template(
+                [{"role": "user", "content": user_text},
+                 {"role": "assistant", "content": "The correct answer is ("}],
+                continue_final_message=True, tokenize=False, **extra)
+        else:
+            text = tok.apply_chat_template(
+                [{"role": "user", "content": ex.prompt}],
+                add_generation_prompt=True, tokenize=False, **extra)
+    else:
+        text = tok.apply_chat_template(
+            [{"role": "user", "content": ex.prompt}],
+            add_generation_prompt=True, tokenize=False, **extra)
     enc = tok(text, return_offsets_mapping=True, return_tensors="pt",
               add_special_tokens=False)
     offsets = enc["offset_mapping"][0].tolist()

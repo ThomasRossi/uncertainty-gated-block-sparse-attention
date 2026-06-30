@@ -8,9 +8,9 @@ Reference implementation, paper, and experiment results for the *value-of-inform
 
 Block-sparse attention selects which key blocks each query attends to via a per-query top-$k$ rule. When the $k$-th and $(k{+}1)$-th block are nearly tied, that cutoff is a coin flip — and dropping the wrong one loses an answer hop with no recovery. We measure the normalised cutoff margin $\sigma$ per Q-tile and, for the bottom $q$-fraction of tiles per layer, double the attended set. The rule is independent of how block scores are computed and composes with existing scoring backbones.
 
-**Headline at 32K, Qwen2.5-14B-Instruct** (paired recall — fraction of dense-correct examples the sparse policy also solves):
+**Headline at 32K, Qwen2.5-14B-Instruct** (RULER NIAH-multikey accuracy; LongBench-v2 paired recall):
 
-| backbone | policy              | RULER NIAH-multikey ($n_{dc}=100$) | LongBench-v2 medium ($n_{dc}=40$) |
+| backbone | policy              | RULER NIAH-multikey ($n=100$) | LongBench-v2 medium ($n_{dc}=40$) |
 |----------|---------------------|---:|---:|
 | —        | dense (ceiling)     | 1.00 | 1.00 |
 | K-mean   | top-$k$             | 0.51 | 0.47 |
@@ -20,16 +20,20 @@ Block-sparse attention selects which key blocks each query attends to via a per-
 
 Router-on-Quest vs top-$k$ on LB-v2 medium ($n=215$, the full dataset subset): **+28 pp paired, McNemar $p<0.01$** — the first statistically clean composition lift on a multi-hop benchmark.
 
-**Cross-model + long context on Qwen2.5-7B-Instruct-1M** (paired recall, RULER NIAH-multikey, $n_{dc}=100$):
+**Cross-architecture: four models, three classes.** The lift reproduces on Qwen2.5-14B, Qwen2.5-7B-1M, Mistral-Nemo-Instruct-2407, and Qwen3.6-35B-A3B (hybrid linear/full-attention + sparse MoE, QK-Norm). On Qwen3.6, QK-Norm flattens the K-min/K-max envelope, so the **winning backbone flips from K-max to K-mean** and router-on-K-mean becomes the dominant policy (RULER NIAH 32K accuracy $0.98$; LB-v2 medium paired $0.92$ at $n_{dc}=88$, the largest paired sample in the project).
 
-| context | top-$k$ | Quest | **router-on-Quest** | dense |
-|---|---:|---:|---:|---:|
-| 32K  | 0.28 | 0.94 | **1.00** | 1.00 |
-| 128K | 0.09 | 0.77 | **0.81** | 1.00 |
+**Long context on Qwen2.5-7B-Instruct-1M and Qwen3.6** (RULER NIAH-multikey accuracy; dense = $1.00$ at all contexts):
 
-The Quest backbone is essentially model-invariant ($0.93 \to 0.94$ across the two models on RULER NIAH at 32K). Mean-pool selection collapses at 128K; the Quest backbone's lift over top-$k$ widens with context ($+66 \to +68$ pp).
+| model            | policy              | 32K | 64K | 128K |
+|------------------|---------------------|----:|----:|-----:|
+| Qwen2.5-7B-1M    | top-$k$             | 0.28 | 0.16 | 0.09 |
+| Qwen2.5-7B-1M    | Quest               | 0.94 | 0.87 | 0.77 |
+| Qwen2.5-7B-1M    | **router-on-Quest** | **1.00** | **0.92** | **0.81** |
+| Qwen3.6-35B-A3B  | top-$k$             | 0.94 | 0.89 | 0.84 |
+| Qwen3.6-35B-A3B  | Quest               | 0.85 | 0.69 | 0.50 |
+| Qwen3.6-35B-A3B  | **router-on-K-mean**| **0.98** | **0.92** | **0.89** |
 
-**Speed.** The fused selection-plus-kernel pipeline runs at $0.97\times$ dense at 32K, $0.76$–$0.85\times$ at 64K, and $0.57$–$0.62\times$ at 128K (Qwen-7B-1M, A100-80GB). The crossover widens structurally with context length: attention is $35\%$ of dense prefill at 32K, $51\%$ at 64K, $63\%$ at 128K.
+**Speed.** The fused selection-plus-kernel pipeline gives a Pareto win at $\geq 64$K on Qwen-7B-1M ($0.62\times$ dense at 128K) and at 128K on Qwen3.6 ($0.80\times$ dense). The crossover regime shifts right on the hybrid+MoE architecture because attention's share of prefill is smaller ($11\% / 19\% / 37\%$ at 32K/64K/128K on Qwen3.6 vs $31\% / 45\% / 63\%$ on Qwen-7B-1M). Qwen3.6 numbers require `flash-linear-attention` + `causal-conv1d` in the image so the linear-attention layers run on fused kernels.
 
 See `paper/summary_for_review.pdf` for the full method, math, and discussion.
 
@@ -58,6 +62,9 @@ release/
 | `modal_app_longbench.py` | Modal entrypoint for LongBench v1 |
 | `modal_app_longbench_v2.py` | Modal entrypoint for LongBench v2 |
 | `modal_app_profile.py` | CUDA-event prefill profiler (32K / 64K / 128K efficiency tables) |
+| `modal_app_qwen36_inspect.py` | Qwen3.6 module-graph inspector (dispatch, QK-Norm placement, MoE shapes) |
+| `modal_app_qwen36_kernel_test.py` | v2 kernel correctness check at Qwen3.6's head_dim=256 vs SDPA |
+| `modal_app_qwen36_smoke.py` | end-to-end Qwen3.6 wiring smoke (dense + sparse forward parity) |
 
 ### `results/`
 
@@ -92,16 +99,33 @@ JSON dumps for the experiments cited in the paper. Each record is one (task, pol
 - `profile_20260601_204936.json` — 32K
 - `profile_20260601_211844.json` — 64K
 
+**Qwen3.6-35B-A3B panel** (paper §4.2–§4.4):
+- LongBench-v2 medium $n=215$, 32K:
+  - `longbench_v2_20260630_003842.json` — Mistral-Nemo-Instruct-2407 (full panel)
+  - `longbench_v2_20260630_095422.json` — Qwen2.5-7B-Instruct-1M (full panel)
+  - `longbench_v2_20260630_105038.json` — Qwen3.6-35B-A3B (full panel)
+- RULER NIAH-multikey, Qwen3.6-35B-A3B, $n=100$:
+  - `ruler_smoke_20260628_133814.json` — 32K, includes budget-match sweep (paper Table 4 Qwen3.6 column)
+  - `ruler_smoke_20260628_120750.json` — 64K
+  - `ruler_smoke_20260628_175145.json` — 128K
+- Prefill profiles, Qwen3.6-35B-A3B, $n=8$ (FLA + causal-conv1d image, H200):
+  - `profile_20260629_114600.json` — 32K
+  - `profile_20260628_231016.json` — 64K
+  - `profile_20260629_121739.json` — 128K
+
 ## Requirements
 
 - Python 3.10+
 - CUDA-capable GPU with sufficient memory for the chosen model:
   - Qwen2.5-14B-Instruct: A100-80GB used for all reported numbers; A100-40GB works at 16K, marginal at 32K
   - Qwen2.5-7B-Instruct-1M: A100-80GB sufficient up to 128K (requires the `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` env var; already set in the Modal image)
+  - Mistral-Nemo-Instruct-2407: A100-80GB at 32K
+  - Qwen3.6-35B-A3B: H200 (does not fit on A100-80GB). The Modal image for Qwen3.6 uses the `nvidia/cuda:13.0.2-devel-ubuntu22.04` base + `flash-linear-attention` + `causal-conv1d` so the 30 linear-attention (Gated DeltaNet) layers and their conv branch use fused kernels; without those the dense prefill is $\approx 4.6\times$ slower.
 - See `requirements.txt`. Key pins:
   - `datasets==2.21.0` (LongBench v1 ships a script-based loader that breaks under `datasets>=3`)
   - `torch>=2.3`, `triton>=2.3`
-  - `transformers>=4.45` (for Qwen2.5 support)
+  - `transformers==5.12.1` for Qwen3.6 (model_type `qwen3_5_moe`); `>=4.45` is sufficient for Qwen2.5 and Mistral-Nemo
+  - `flash-linear-attention`, `causal-conv1d` (only for Qwen3.6 — see hardware note above)
   - `modal` (optional; only needed for the Modal-hosted reproducibility path)
 
 ## Reproducing the headline numbers
@@ -152,6 +176,23 @@ modal run modal_app_ruler.py --ctxlen 32768 --n-per 100 \
     --router-values "0.40" --router-score "quest" \
     --budget-sweep-policy "quest" \
     --budget-values "40,47,52,66"
+
+# Qwen3.6-35B-A3B panel (§4.2–§4.4): one pass per harness with
+# --router-score-sweep "mean,quest" produces both backbones of the router
+# in a single run. Requires H200 and the FLA + causal-conv1d image (set
+# SUBQ_GPU=H200:1 if you use the env-controlled GPU dispatcher in the
+# harness).
+modal run modal_app_ruler.py --ctxlen 32768 --n-per 100 \
+    --policies "dense,topk,quest,router" \
+    --router-values "0.40" --router-score-sweep "mean,quest" \
+    --tasks "niah_multikey" --budget-values "40,47,52,66" \
+    --model "Qwen/Qwen3.6-35B-A3B"
+modal run modal_app_longbench_v2.py --length medium --n-per 215 \
+    --policies "dense,topk,quest,router" \
+    --router-values "0.40" --router-score-sweep "mean,quest" \
+    --model "Qwen/Qwen3.6-35B-A3B"
+modal run modal_app_profile.py --ctxlen 131072 --n-per 8 \
+    --model "Qwen/Qwen3.6-35B-A3B"
 ```
 
 The ablation harness adds an audit table at the end of each run, derived from `policy` labels and `matched_budget` via the `_policy_eff_budget` helper — no mutation of the cache-keyed result records, so prior cached panels validate without re-running. The `--model` flag accepts any HF-hosted Qwen-family or compatible LLM.

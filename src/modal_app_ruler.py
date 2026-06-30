@@ -24,17 +24,19 @@ MODEL = "Qwen/Qwen2.5-14B-Instruct"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "transformers==5.9.0", "accelerate",
-                 "safetensors", "hf_transfer")
+    .pip_install("torch", "transformers==5.12.1", "accelerate",
+                 "safetensors", "hf_transfer", "triton",
+                 "sentencepiece", "tiktoken")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     .add_local_python_source("sparse_attention", "ruler_tasks", "poc_core",
                              "pointer_haystack", "result_cache",
-                             "triton_block_attn", "dump_block_scores")
+                             "triton_block_attn", "q_chunk_patch",
+                             "dump_block_scores")
 )
 
 cache = modal.Volume.from_name("voi-router-hf-cache", create_if_missing=True)
-app = modal.App("voi-router-ruler")
+app = modal.App("voi-router-ruler-smoke")
 
 
 def _policy_eff_budget(policy: str, matched_budget: int):
@@ -69,8 +71,13 @@ def _policy_eff_budget(policy: str, matched_budget: int):
     return 2 * matched_budget
 
 
-@app.function(image=image, gpu="A100-80GB", volumes={"/cache": cache},
-              timeout=14400)
+import os as _os
+_GPU = _os.environ.get("SUBQ_GPU", "A100-80GB")
+_TIMEOUT = int(_os.environ.get("SUBQ_TIMEOUT", "14400"))
+
+
+@app.function(image=image, gpu=_GPU, volumes={"/cache": cache},
+              timeout=_TIMEOUT)
 def experiment(n_per: int, ctx: int, buckets: list,
                policies: list, fixed_budget: int,
                router_mode: str, router_grain: str, router_values: list,
@@ -80,15 +87,28 @@ def experiment(n_per: int, ctx: int, buckets: list,
                budget_values: list, budget_sweep_policy: str,
                model_name: str = MODEL,
                dump_block_scores_path: str = "",
-               no_cache: bool = False):
+               no_cache: bool = False,
+               router_score_sweep: list = None):
+    """router_score_sweep: optional list of scoring backbones to loop the
+    router over (e.g. ["mean", "quest"]). Falls back to [router_score] for
+    backward compat with single-score callers."""
     import random
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    import os
     import sparse_attention
     import poc_core
     from result_cache import ResultCache
+
+    # Install the Q-tile-chunked v2 selection at very long context to bound the
+    # intermediate `[B, H, Q, NB]` matmul that OOMs at 1M. Numerically
+    # equivalent to the in-tree version; lives outside `code_version` so the
+    # result cache stays valid.
+    if ctx >= int(os.environ.get("SUBQ_QCHUNK_CTX_MIN", "262144")):
+        import q_chunk_patch
+        q_chunk_patch.install()
 
     rng = random.Random(seed)
     examples = [(task, kw, poc_core.make_example(rng, task, kw, ctx))
@@ -101,19 +121,46 @@ def experiment(n_per: int, ctx: int, buckets: list,
     print(f"loading model: {model_name}", flush=True)
     tok_kwargs = {"fix_mistral_regex": True} if "mistral" in model_name.lower() else {}
     tok = AutoTokenizer.from_pretrained(model_name, **tok_kwargs)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16, attn_implementation="block_sparse"
-    ).to("cuda").eval()
+    # Multi-GPU: enforce balanced layer sharding so KV cache + activations
+    # split evenly. "auto" doesn't shard a 14 GB model — it fits all weights
+    # on cuda:0 (or in our case cuda:1) and lets activations pile up on a
+    # single card. "balanced_low_0" forces an even layer-by-layer split
+    # while keeping cuda:0 lighter so embed_in / lm_head have room.
+    model_kwargs = dict(dtype=torch.bfloat16, attn_implementation="block_sparse")
+    ndev = torch.cuda.device_count()
+    if ndev > 1:
+        # Reserve ~10 GB per device for activations the accelerate planner
+        # can't see (KV cache grows during runtime, not at load time).
+        per_dev = "120GiB"
+        model_kwargs["device_map"] = "balanced_low_0"
+        model_kwargs["max_memory"] = {i: per_dev for i in range(ndev)}
+        model = AutoModelForCausalLM.from_pretrained(model_name,
+                                                     **model_kwargs).eval()
+        dm = getattr(model, "hf_device_map", None) or getattr(
+            getattr(model, "model", None), "hf_device_map", None)
+        print(f"multi-gpu device_map: {dm}", flush=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, **model_kwargs).to("cuda").eval()
     cache.commit()
-    sparse_attention.install_rollout_hooks(model)
-    print(f"model loaded, gpu={torch.cuda.get_device_name()}", flush=True)
+    # install_rollout_hooks attaches a per-layer pre-hook that stashes the
+    # input hidden state via `SEL.hidden_at[idx] = hs.detach()`. At 1M with
+    # 28 layers and 3584-wide hidden, that's ~196 GB of dead state per
+    # prefill for any policy that isn't rollout_peek. None of the policies
+    # in this smoke (dense/topk/quest/router) need rollout_peek, so skip the
+    # install entirely. Re-enable only when a rollout_peek pass is needed.
+    if any(p in ("rollout_peek",) for p in policies):
+        sparse_attention.install_rollout_hooks(model)
+    print(f"model loaded, ngpu={torch.cuda.device_count()}, "
+          f"gpu0={torch.cuda.get_device_name(0)}", flush=True)
 
     # Diagnostic dump for the BAI/VoI appendix: install AFTER model load, BEFORE
     # any prefill, so every sparse-selection call is captured. Lives outside the
-    # cache-key file set so existing result_cache entries are not invalidated by
-    # its presence. A diagnostic run additionally bypasses the result_cache
-    # (no_cache=True is implied) because a cache hit short-circuits the forward
-    # and there would be no scores to dump.
+    # cache-key file set (sparse_files in `hash_files` above) so existing
+    # result_cache entries are not invalidated by its presence. A diagnostic run
+    # additionally bypasses the result_cache (no_cache=True is implied) because
+    # a cache hit short-circuits the forward and there would be no scores to
+    # dump.
     if dump_block_scores_path:
         import dump_block_scores as _dbs
         _dbs.install_dump_hook(dump_block_scores_path)
@@ -136,7 +183,11 @@ def experiment(n_per: int, ctx: int, buckets: list,
             sparse_attention.SEL.router_quantile = router_values[0]
         else:
             sparse_attention.SEL.router_tau = router_values[0]
-    result = poc_core.run_sweep(model, tok, examples, "cuda",
+    # With device_map sharding, the embed_tokens may not be on cuda:0.
+    # Inputs must go to the embedding's device; everything else follows.
+    input_dev = str(next(model.get_input_embeddings().parameters()).device)
+    print(f"input device: {input_dev}", flush=True)
+    result = poc_core.run_sweep(model, tok, examples, input_dev,
                                 policies=tuple(base_pols), fixed_budget=fb,
                                 cache=result_cache, model_name=model_name,
                                 code_version=code_version,
@@ -144,27 +195,30 @@ def experiment(n_per: int, ctx: int, buckets: list,
     if "router" in policies and router_values:
         matched = result["matched_budget"]
         sparse_attention.SEL.budget_blocks = matched
-        for val in router_values:
-            if router_mode == "quantile":
-                sparse_attention.SEL.router_quantile = val
-                label_knob = f"q{val}"
-            else:
-                sparse_attention.SEL.router_tau = val
-                label_knob = f"tau{val}"
-            if router_score != "mean":
-                label_knob = f"{label_knob}_{router_score}"
-            print(f"\n=== router[{router_mode}] {label_knob} ===", flush=True)
-            for i, (task, kw, ex) in enumerate(examples):
-                r = poc_core.run_one(model, tok, ex, "router", "cuda",
-                                     cache=result_cache, model_name=model_name,
-                                     code_version=code_version,
-                                     dense_code_version=dense_code_version)
-                row = dict(task=task, diff=str(kw),
-                           policy=f"router_{label_knob}", **r)
-                result["rows"].append(row)
-                print(f"[router {label_knob} {i+1}/{len(examples)}] "
-                      f"{task} {kw} recall={r['recall']:.2f} "
-                      f"hit={r['hit']:.2f} {r['dt']:.1f}s", flush=True)
+        scores_to_run = router_score_sweep or [router_score]
+        for score in scores_to_run:
+            sparse_attention.SEL.router_score = score
+            for val in router_values:
+                if router_mode == "quantile":
+                    sparse_attention.SEL.router_quantile = val
+                    label_knob = f"q{val}"
+                else:
+                    sparse_attention.SEL.router_tau = val
+                    label_knob = f"tau{val}"
+                if score != "mean":
+                    label_knob = f"{label_knob}_{score}"
+                print(f"\n=== router[{router_mode}] {label_knob} ===", flush=True)
+                for i, (task, kw, ex) in enumerate(examples):
+                    r = poc_core.run_one(model, tok, ex, "router", input_dev,
+                                         cache=result_cache, model_name=model_name,
+                                         code_version=code_version,
+                                         dense_code_version=dense_code_version)
+                    row = dict(task=task, diff=str(kw),
+                               policy=f"router_{label_knob}", **r)
+                    result["rows"].append(row)
+                    print(f"[router {label_knob} {i+1}/{len(examples)}] "
+                          f"{task} {kw} recall={r['recall']:.2f} "
+                          f"hit={r['hit']:.2f} {r['dt']:.1f}s", flush=True)
         if result_cache is not None:
             result_cache.save()
             cache.commit()
@@ -177,7 +231,7 @@ def experiment(n_per: int, ctx: int, buckets: list,
             print(f"\n=== budget sweep: {label} ===", flush=True)
             for i, (task, kw, ex) in enumerate(examples):
                 r = poc_core.run_one(model, tok, ex, budget_sweep_policy,
-                                     "cuda",
+                                     input_dev,
                                      cache=result_cache, model_name=model_name,
                                      code_version=code_version,
                                      dense_code_version=dense_code_version)
@@ -192,6 +246,9 @@ def experiment(n_per: int, ctx: int, buckets: list,
     if result_cache is not None:
         print(result_cache.summary(), flush=True)
 
+    # Flush the diagnostic shards to disk if dumping was on. Path lives under
+    # /cache so it persists on the Modal Volume; download with
+    # `modal volume get voi-router-hf-cache <path>`.
     if dump_block_scores_path:
         import dump_block_scores as _dbs
         _dbs.flush_and_teardown()
@@ -216,10 +273,12 @@ def main(n_per: int = 2, ctxlen: int = 32768,
          num_keys: int = 4,
          num_hops: int = 3,
          num_distractor_chains: int = 3,
+         tasks: str = "niah_multikey,vt",
          router_mode: str = "quantile",
          router_grain: str = "row",
          router_values: str = "0.20",
          router_score: str = "mean",
+         router_score_sweep: str = "",
          budget_values: str = "",
          budget_sweep_policy: str = "quest",
          seed: int = 0,
@@ -229,14 +288,17 @@ def main(n_per: int = 2, ctxlen: int = 32768,
          no_cache: bool = False):
     # RULER smoke: two tasks at the same ctx -- NIAH (single-hop budget
     # contention) and VT (multi-hop chain tracing).
-    buckets = [
-        ("niah_multikey", {"num_keys": num_keys}),
-        ("vt", {"num_hops": num_hops,
-                "num_distractor_chains": num_distractor_chains}),
-    ]
+    task_list = [t.strip() for t in tasks.split(",") if t.strip()]
+    bucket_specs = {
+        "niah_multikey": ("niah_multikey", {"num_keys": num_keys}),
+        "vt": ("vt", {"num_hops": num_hops,
+                      "num_distractor_chains": num_distractor_chains}),
+    }
+    buckets = [bucket_specs[t] for t in task_list]
     pols = [p.strip() for p in policies.split(",")]
     val_list = [float(v.strip()) for v in router_values.split(",") if v.strip()]
     bud_list = [int(v.strip()) for v in budget_values.split(",") if v.strip()]
+    score_sweep = [s.strip() for s in router_score_sweep.split(",") if s.strip()] or None
 
     from result_cache import hash_files
     prompt_files = ["poc_core.py", "ruler_tasks.py", "pointer_haystack.py"]
@@ -250,7 +312,8 @@ def main(n_per: int = 2, ctxlen: int = 32768,
                                seed, kernel_v2,
                                code_version, dense_code_version,
                                bud_list, budget_sweep_policy, model,
-                               dump_block_scores, no_cache)
+                               dump_block_scores, no_cache,
+                               router_score_sweep=score_sweep)
 
     import poc_core
     print("\n" + poc_core.summary_table(buckets, result["rows"]))

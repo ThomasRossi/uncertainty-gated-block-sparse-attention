@@ -17,16 +17,38 @@ Usage:
   modal run modal_app_profile.py --n-per 4
 """
 
+import os as _os
 import time
 
 import modal
 
 MODEL = "Qwen/Qwen2.5-14B-Instruct"
+_GPU = _os.environ.get("SUBQ_GPU", "A100-80GB")
 
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "transformers==5.9.0", "accelerate",
-                 "safetensors", "hf_transfer")
+    # nvidia/cuda devel image: ships nvcc so causal-conv1d (Gated DeltaNet
+    # fused conv branch) builds from source. debian_slim lacks nvcc and the
+    # build fails at the bdist_wheel step.
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.2-devel-ubuntu22.04",
+        add_python="3.11",
+    )
+    # clang: causal-conv1d's source build (no prebuilt wheel for cu13/torch
+    # 2.12) requires clang++ >=7. ninja: pytorch's cpp_extension build system.
+    .apt_install("clang", "ninja-build", "git")
+    .pip_install("torch", "transformers==5.12.1", "accelerate",
+                 "safetensors", "hf_transfer", "ninja", "packaging",
+                 "wheel", "setuptools",
+                 "flash-linear-attention", "causal-conv1d")
+    # Tried + abandoned during 2026-06-28/29 image iteration:
+    # - megablocks 0.10.0: fails to compile against CUDA 13.0's cub
+    #   (csrc/cumsum.h uses pre-CUDA-12 cub::DeviceScan::ExclusiveSum
+    #   signature with separate stream + debug_synchronous args).
+    # - flash-attn 2.8.3: no prebuilt wheel for cu13/torch 2.12 and the
+    #   source build OOMs on Modal's image builder (parallel nvcc on 30+
+    #   kernels needs >20GB RAM/job).
+    # Future work: vLLM fused_moe, grouped_gemm, or HF kernels lib with the
+    # correct LayerRepository(repo_id, layer_name, revision) spec.
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache",
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     .add_local_python_source("sparse_attention", "ruler_tasks", "poc_core",
@@ -38,7 +60,7 @@ cache = modal.Volume.from_name("voi-router-hf-cache", create_if_missing=True)
 app = modal.App("voi-router-profile")
 
 
-@app.function(image=image, gpu="A100-80GB", volumes={"/cache": cache},
+@app.function(image=image, gpu=_GPU, volumes={"/cache": cache},
               timeout=3600)
 def profile(n_per: int, ctx: int, buckets: list, fixed_budget: int,
             router_quantile: float, seed: int, model_name: str = MODEL):

@@ -27,8 +27,9 @@ MODEL = "Qwen/Qwen2.5-14B-Instruct"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "transformers==5.9.0", "accelerate",
-                 "safetensors", "hf_transfer",
+    .pip_install("torch", "transformers==5.12.1", "accelerate",
+                 "safetensors", "hf_transfer", "triton",
+                 "sentencepiece", "tiktoken",
                  "datasets==2.21.0")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache",
           "HF_DATASETS_CACHE": "/cache/datasets_v221",
@@ -67,7 +68,11 @@ def _policy_eff_budget(policy: str, matched_budget: int):
     return 2 * matched_budget
 
 
-@app.function(image=image, gpu="A100-80GB", volumes={"/cache": cache},
+import os as _os
+_GPU = _os.environ.get("SUBQ_GPU", "A100-80GB")
+
+
+@app.function(image=image, gpu=_GPU, volumes={"/cache": cache},
               timeout=14400)
 def experiment(length: str, difficulty: str, n_per: int, ctx: int,
                policies: list, fixed_budget: int,
@@ -76,7 +81,9 @@ def experiment(length: str, difficulty: str, n_per: int, ctx: int,
                kernel_v2: bool, seed: int,
                code_version: str, dense_code_version: str,
                budget_values: list, budget_sweep_policy: str,
-               model_name: str = MODEL):
+               model_name: str = MODEL,
+               router_score_sweep: list = None,
+               max_new: int = 8):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -119,38 +126,41 @@ def experiment(length: str, difficulty: str, n_per: int, ctx: int,
             sparse_attention.SEL.router_quantile = router_values[0]
         else:
             sparse_attention.SEL.router_tau = router_values[0]
-    # max_new=8 is plenty for MC (just need the letter); keeps decode cost down.
+    # max_new=max_new is plenty for MC (just need the letter); keeps decode cost down.
     result = poc_core.run_sweep(model, tok, examples, "cuda",
                                 policies=tuple(base_pols), fixed_budget=fb,
-                                max_new=8,
+                                max_new=max_new,
                                 cache=result_cache, model_name=model_name,
                                 code_version=code_version,
                                 dense_code_version=dense_code_version)
     if "router" in policies and router_values:
         matched = result["matched_budget"]
         sparse_attention.SEL.budget_blocks = matched
-        for val in router_values:
-            if router_mode == "quantile":
-                sparse_attention.SEL.router_quantile = val
-                label_knob = f"q{val}"
-            else:
-                sparse_attention.SEL.router_tau = val
-                label_knob = f"tau{val}"
-            if router_score != "mean":
-                label_knob = f"{label_knob}_{router_score}"
-            print(f"\n=== router[{router_mode}] {label_knob} ===", flush=True)
-            for i, (task, kw, ex) in enumerate(examples):
-                r = poc_core.run_one(model, tok, ex, "router", "cuda",
-                                     max_new=8,
-                                     cache=result_cache, model_name=model_name,
-                                     code_version=code_version,
-                                     dense_code_version=dense_code_version)
-                row = dict(task=task, diff=str(kw),
-                           policy=f"router_{label_knob}", **r)
-                result["rows"].append(row)
-                print(f"[router {label_knob} {i+1}/{len(examples)}] "
-                      f"{task} {kw} recall={r['recall']:.2f} "
-                      f"{r['dt']:.1f}s", flush=True)
+        scores_to_run = router_score_sweep or [router_score]
+        for score in scores_to_run:
+            sparse_attention.SEL.router_score = score
+            for val in router_values:
+                if router_mode == "quantile":
+                    sparse_attention.SEL.router_quantile = val
+                    label_knob = f"q{val}"
+                else:
+                    sparse_attention.SEL.router_tau = val
+                    label_knob = f"tau{val}"
+                if score != "mean":
+                    label_knob = f"{label_knob}_{score}"
+                print(f"\n=== router[{router_mode}] {label_knob} ===", flush=True)
+                for i, (task, kw, ex) in enumerate(examples):
+                    r = poc_core.run_one(model, tok, ex, "router", "cuda",
+                                         max_new=max_new,
+                                         cache=result_cache, model_name=model_name,
+                                         code_version=code_version,
+                                         dense_code_version=dense_code_version)
+                    row = dict(task=task, diff=str(kw),
+                               policy=f"router_{label_knob}", **r)
+                    result["rows"].append(row)
+                    print(f"[router {label_knob} {i+1}/{len(examples)}] "
+                          f"{task} {kw} recall={r['recall']:.2f} "
+                          f"{r['dt']:.1f}s", flush=True)
     # Budget ablation sweep: re-run `budget_sweep_policy` at each budget value.
     # Label rows `{policy}_b{N}` so summary/paired tables show them distinctly.
     # Quality-vs-budget Pareto for the policy; lets us check whether the
@@ -162,7 +172,7 @@ def experiment(length: str, difficulty: str, n_per: int, ctx: int,
             print(f"\n=== budget sweep: {label} ===", flush=True)
             for i, (task, kw, ex) in enumerate(examples):
                 r = poc_core.run_one(model, tok, ex, budget_sweep_policy,
-                                     "cuda", max_new=8,
+                                     "cuda", max_new=max_new,
                                      cache=result_cache, model_name=model_name,
                                      code_version=code_version,
                                      dense_code_version=dense_code_version)
@@ -211,14 +221,17 @@ def main(length: str = "medium", difficulty: str = "",
          router_grain: str = "row",
          router_values: str = "0.40",
          router_score: str = "mean",
+         router_score_sweep: str = "",
          kernel_v2: bool = True,
          budget_values: str = "",
          budget_sweep_policy: str = "quest",
          seed: int = 42,
-         model: str = MODEL):
+         model: str = MODEL,
+         max_new: int = 8):
     pol_list = [p.strip() for p in policies.split(",")]
     val_list = [float(v.strip()) for v in router_values.split(",") if v.strip()]
     bud_list = [int(v.strip()) for v in budget_values.split(",") if v.strip()]
+    score_sweep = [s.strip() for s in router_score_sweep.split(",") if s.strip()] or None
 
     from result_cache import hash_files
     prompt_files = ["poc_core.py", "ruler_tasks.py", "pointer_haystack.py",
@@ -231,7 +244,9 @@ def main(length: str = "medium", difficulty: str = "",
                                fixed_budget, router_mode, router_grain,
                                val_list, router_score, kernel_v2, seed,
                                code_version, dense_code_version,
-                               bud_list, budget_sweep_policy, model)
+                               bud_list, budget_sweep_policy, model,
+                               router_score_sweep=score_sweep,
+                               max_new=max_new)
 
     import poc_core
     print("\n" + poc_core.summary_table(result["buckets"], result["rows"]))
