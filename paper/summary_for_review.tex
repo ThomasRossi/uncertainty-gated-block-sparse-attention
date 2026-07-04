@@ -16,7 +16,9 @@
 
 \newtheorem{proposition}{Proposition}
 \newtheorem{lemma}{Lemma}
-\newcommand{\TODO}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+\newtheorem{observation}{Observation}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
 \newcommand{\kbudget}{k_{\text{budget}}}
 \newcommand{\NB}{N_{\!B}}
 \newcommand{\dhead}{d_{\text{head}}}
@@ -32,14 +34,14 @@
 \maketitle
 
 \begin{abstract}
-\textcolor{red}{Block-sparse attention scales long-context language models by replacing the $O(N^2)$ softmax with a per-query top-$k$ selection over key blocks. This cutoff is myopic: when the $k$-th and $(k{+}1)$-th blocks are nearly tied in score, the selector commits without spending extra budget, and a dropped block carrying answer evidence is unrecoverable downstream. We propose a value-of-information \emph{router} that measures, for each query, how decisively the top-$k$ cut was made, and doubles the kept set for the queries where that gap is smallest; the rule is backbone-agnostic and stacks with existing block-scoring methods such as Quest. On LongBench-v2 medium at $n=215$ (the entire dataset subset), router-on-Quest reaches paired recall $0.75$ vs.\ top-$k$ $0.47$ -- $+28$\,pp over the SSA-style baseline (McNemar $p<0.01$) -- and lands within $2$\,pp of dense on RULER NIAH multikey at the same context. The lift reproduces on four models from three architectures (Qwen2.5, Mistral-Nemo, Qwen3.6). At $128$K, the router preserves $0.81$ and $0.89$ of dense accuracy on Qwen2.5-7B-1M and Qwen3.6 (vs.\ SSA-style top-$k$ at $0.09$ on the former) while the fused selection-plus-kernel pipeline runs at $0.62\times$ and $0.80\times$ dense wall time.}
+Block-sparse attention scales long-context language models by replacing the $O(N^2)$ softmax with a per-query top-$k$ selection over key blocks. This cutoff is myopic: when the $k$-th and $(k{+}1)$-th blocks are nearly tied in score, the selector commits without spending extra budget, and a dropped block carrying answer evidence is unrecoverable downstream. We propose a value-of-information \emph{router} that measures, for each query, how decisively the top-$k$ cut was made, and doubles the kept set for the queries where that gap is smallest; the rule is backbone-agnostic and stacks with existing block-scoring methods such as Quest. On LongBench-v2 medium at $n=215$ (the entire dataset subset), router-on-Quest reaches paired recall $0.75$ vs.\ top-$k$ $0.47$ -- $+28$\,pp over the SSA-style baseline (McNemar $p<0.01$) -- and lands within $2$\,pp of dense on RULER NIAH multikey at the same context. The lift reproduces on four models from three architectures (Qwen2.5, Mistral-Nemo, Qwen3.6). At $128$K, the router preserves $0.81$ and $0.89$ of dense accuracy on Qwen2.5-7B-1M and Qwen3.6 (vs.\ SSA-style top-$k$ at $0.09$ on the former) while the fused selection-plus-kernel pipeline runs at $0.62\times$ and $0.80\times$ dense wall time.
 \end{abstract}
 
 %========================================================================
 \section{Introduction}
 %========================================================================
 
-Long-context language models increasingly use \emph{block-sparse attention} as a drop-in replacement for the $O(N^2)$ softmax. The idea is shared by Quest~\citep{tang2024quest}, H2O~\citep{zhang2023h2o}, SnapKV~\citep{li2024snapkv}, MInference~\citep{jiang2024minference}, NSA~\citep{yuan2025nsa}, MoBA~\citep{lu2025moba}, and Subquadratic's SSA~\citep{ssa2025}: a cheap per-query \emph{selector} picks $k$ out of $\NB$ key blocks; exact attention then runs only on the selected set. The selector is the lever -- it decides where the model attends. Today it is universally implemented as a \emph{single-shot top-$k$ rule} on a pooled inner product $q \cdot \bar k_b$ between the query and a per-block key summary.
+Long-context language models increasingly use \emph{block-sparse attention} as a drop-in replacement for the $O(N^2)$ softmax. The idea is shared by Quest~\citep{tang2024quest}, H2O~\citep{zhang2023h2o}, SnapKV~\citep{li2024snapkv}, MInference~\citep{jiang2024minference}, NSA~\citep{yuan2025nsa}, MoBA~\citep{lu2025moba}, and Subquadratic's SSA~\citep{ssa2025}: a cheap per-query \emph{selector} picks $k$ out of $\NB$ key blocks; exact attention then runs only on the selected set. The selector is the lever -- it decides where the model attends.
 
 This is a myopic decision. When the $k$-th and $(k{+}1)$-th block are nearly tied, top-$k$ silently breaks the tie and moves on; if the dropped block contained an evidence token, the answer is gone, and no downstream layer can recover it. The failure mode is structural, not noisy: it bites hardest on \emph{multi-hop} and \emph{query-latent} retrieval, where the relevance of a block depends on what was learned earlier in the same forward pass and is not visible to the selector's surface query--key match. SSA's own reported NIAH multi-key recall degrades sharply as the number of keys grows~\citep{ssa2025}.
 
@@ -54,8 +56,8 @@ where $s_{(\cdot)}$ are the sorted block scores. A small $\sigma$ means the cuto
 \textbf{Contributions.}
 \begin{enumerate}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
     \item A VoI formulation of the selector cutoff that adds one scalar per tile and one quantile threshold per layer, independent of the block-scoring backbone. No retraining, no extra parameters, no per-row keep tensor.
-    \item Empirical demonstration that the router composes with two distinct scoring backbones (SSA-style K-mean and Quest's K-min/K-max) and that, on every model in the panel, the router-lifted version of the \emph{winning} backbone dominates the unlifted version of the other. The result holds on two standardised benchmarks (RULER NIAH multi-key and LongBench-v2 medium), four models from three architecture classes (Qwen2.5-14B-Instruct, Qwen2.5-7B-Instruct-1M, Mistral-Nemo-Instruct-2407, Qwen3.6-35B-A3B), and contexts from $32$K to $128$K. Headline: router-on-Quest paired recall $\mathbf{0.75}$ vs top-$k$ $0.47$ on LongBench-v2 medium at $n=215$ ($+28$\,pp, McNemar $p<0.01$). Cross-architecture finding: on QK-Norm models (Qwen3.6), K-mean dominates K-max and \emph{router-on-K-mean} replaces router-on-Quest as the headline composition -- the scoring-backbone choice is data-dependent on the trained attention distribution, but the router lifts whichever wins. Full panel in Section~\ref{sec:experiments}.
-    \item A fused selection-plus-kernel implementation that produces $\texttt{kv\_idx}$ directly per Q-tile and handles the routed expansion in the same code path, keeping kernel dispatch shape-uniform. All four sparse policies (top-$k$, router, Quest, router-on-Quest) run on this same kernel; they differ only in the selection step. Wall-time profile crosses dense at 32K and widens at 64K ($0.76\times$--$0.85\times$); the crossover regime is characterised via an Amdahl decomposition of the prefill.
+    \item Empirical demonstration that the router composes with two distinct scoring backbones (SSA-style K-mean and Quest's K-min/K-max) and that, on every model in the panel, the router-lifted version of the \emph{winning} backbone dominates the unlifted version of the other. The result holds on two standardised benchmarks (RULER NIAH multi-key and LongBench-v2 medium), four models from three architecture classes, and contexts from $32$K to $128$K. Which backbone wins is model-dependent -- QK-Norm flips the winner from Quest's K-max to the SSA-style K-mean -- but the router lifts whichever wins. Full panel in Section~\ref{sec:experiments}.
+    \item A fused selection-plus-kernel implementation that produces $\texttt{kv\_idx}$ directly per Q-tile and handles the routed expansion in the same code path, keeping kernel dispatch shape-uniform. All four sparse policies (top-$k$, router, Quest, router-on-Quest) run on this same kernel; they differ only in the selection step. Wall-time profile crosses dense between $32$K and $64$K on Qwen2.5-7B-1M ($0.87\times$ dense at $64$K, $0.62\times$ at $128$K) and between $64$K and $128$K on the hybrid Qwen3.6 ($0.80\times$ at $128$K); the crossover regime is characterised via an Amdahl decomposition of the prefill.
     \item A custom diagnostic benchmark, the \emph{Pointer-Chase Haystack} (PCH; Appendix~\ref{app:pch}), used during method development to isolate selector quality from model capability.
     \item A negative-control result (LongBench-v1) that pins down \emph{when} the router helps: only when the selector's per-query budget (the blocks it keeps) is small relative to where the answer-relevant evidence lives.
 \end{enumerate}
@@ -132,7 +134,7 @@ Following the SSA recipe, we group $\BlockM = 64$ consecutive query rows into a 
 \end{equation}
 The sink block $0$ and the tile's own block are forced into $\text{kv\_idx}$ by adding $+\infty$ to their scores \emph{before} the top-$k$, which avoids a downstream concat-and-dedup. The output is a single integer tensor of shape $[B, H, Q_t, \kbudget]$ (where $Q_t = M/\BlockM$), passed straight to the attention kernel without a per-row inner mask. Wall time for selection scales as $O(N \NB / \BlockM)$ rather than $O(N \NB)$ for the per-row version.
 
-This is coarser than per-row by construction: a block that one row in the tile strongly wants can be outranked by a block that several rows weakly want, since the tile score is a max over rows of an inner product. The router (Steps 3--6) addresses this -- it spends a controlled amount of extra budget on the tiles where the top-$k$ cut was ambiguous, while leaving confident tiles untouched.
+This is coarser than per-row by construction: a block that one row in the tile strongly wants can be outranked by a block that several rows weakly want, since the tile score is a max over rows of an inner product. The router (Steps 3--5) addresses this -- it spends a controlled amount of extra budget on the tiles where the top-$k$ cut was ambiguous, while leaving confident tiles untouched.
 
 \subsection{Step 3: the cutoff is a decision -- read its uncertainty}
 
@@ -148,21 +150,13 @@ The interpretation is direct:
 \end{itemize}
 $\sigma$ is computed from a top-$(k{+}1)$ partial sort -- one extra element beyond the top-$k$ that produces $\text{kv\_idx}$ -- at no extra asymptotic cost.
 
-\paragraph{Why this is a value-of-information signal.} If we were to commit to the top-$k$, the expected loss from the cutoff decision is bounded by the probability mass the softmax would have placed on the dropped block. When the $k$-th and $(k{+}1)$-th scores are close, that mass is large; when they are well-separated, it is small. The cutoff margin $\sigma$ is a cheap, dimensionless proxy for this expected loss. The formal anchor is in Appendix~\ref{app:bai}: under a sub-Gaussian noise model on the block scores, $\sigma$ is the dimensionless analogue of the asymptotically optimal best-arm-identification exploration index of \citet{garivier2016optimal}, and the $\sigma$-quantile router is $C(\tau)$-times optimal in top-$k$ identification, with $C(\tau) \le 2$ under Gaussian noise.
+\paragraph{Why this is a value-of-information signal.} If we were to commit to the top-$k$, the expected loss from the cutoff decision is bounded by the probability mass the softmax would have placed on the dropped block. When the $k$-th and $(k{+}1)$-th scores are close, that mass is large; when they are well-separated, it is small. The cutoff margin $\sigma$ is a cheap, dimensionless proxy for this expected loss. The formal anchor is in Appendix~\ref{app:bai}: under a Gaussian noise model on the block scores, $\sigma$ is the dimensionless analogue of the best-arm-identification exploration index of \citet{garivier2016optimal}; expanding the kept set never increases the identification error, pointwise; and the $\sigma$-quantile router satisfies a finite-sample regret bound against the best trigger rule of the same budget (Proposition~\ref{prop:bai-bound}).
 
-\subsection{Step 4: aggregate $\sigma$ across heads}
+\subsection{Step 4: aggregate $\sigma$ across heads and trigger on the bottom $q$-fraction}
 
-We aggregate the per-head margin $\sigma[t,h]$ to a per-tile signal via a uniform mean:
-\begin{equation}\label{eq:sigma-bar}
-\bar\sigma[t] \;=\; \frac{1}{H}\sum_{h=1}^{H} \sigma[t,h].
-\end{equation}
-$\bar\sigma[t]$ is the tile's overall decision confidence: low when many heads simultaneously face an ambiguous cutoff, high when most heads agree the cutoff is clean.
+We aggregate the per-head margin to a per-tile signal via a uniform mean, $\bar\sigma[t] = \frac{1}{H}\sum_{h=1}^{H} \sigma[t,h]$: the tile's overall decision confidence, low when many heads simultaneously face an ambiguous cutoff, high when most heads agree the cutoff is clean. Aggregation is necessary -- gating directly on the per-cell $\sigma[t,h]$ does not work (Appendix~\ref{app:row-vs-cell}): heads in the same tile are highly correlated, so per-cell gating is dominated by per-head idiosyncratic noise that has no relation to whether the tile is actually ambiguous. Averaging across heads recovers the signal.
 
-Aggregation is necessary: gating directly on the per-cell $\sigma[t,h]$ does not work (Appendix~\ref{app:row-vs-cell}). Heads in the same tile are highly correlated, and per-cell gating is dominated by per-head idiosyncratic noise that has no relation to whether the tile is actually ambiguous. Averaging across heads recovers the signal.
-
-\subsection{Step 5: trigger on the bottom $q$-fraction}
-
-We turn $\bar\sigma$ into a binary decision via a per-layer empirical quantile:
+We then turn $\bar\sigma$ into a binary decision via a per-layer empirical quantile:
 \begin{equation}\label{eq:trigger}
 \text{trigger}[t] \;=\; \mathbb{1}\!\Bigl[\bar\sigma[t] \;\le\; \operatorname{quantile}_q\bigl(\bar\sigma[\,\cdot\,]\bigr)\Bigr].
 \end{equation}
@@ -172,19 +166,11 @@ $q$ is the only hyperparameter introduced by the router; intuitively it is the p
 
 \paragraph{Why a quantile, not an absolute threshold.} The absolute scale of $\sigma$ varies across layers (early layers are more peaked than later layers). A quantile is the simplest layer-conditional normalisation. We did test absolute and per-cell quantile thresholds; they fail (Appendix~\ref{app:row-vs-cell}).
 
-\subsection{Step 6: expand $\text{kv\_idx}$ uniformly}
+\subsection{Step 5: expand $\text{kv\_idx}$ uniformly}
 
 Triggered tiles get a $\rho\times$ expanded top-$k$ over $\text{tile\_score}$ (we use $\rho = 2$). The selection operation here is the same top-$k$ that every selector in the literature reduces to; $\text{tile\_score}$ inherits whichever block-scoring backbone of §\ref{sec:method} is in play (Eq.~\eqref{eq:block-score} or Eq.~\eqref{eq:quest-score}), so the same expansion rule applies to both ``router'' and ``router-on-Quest'' without modification.
 
-To preserve a fixed kernel dispatch shape across triggered and non-triggered tiles, we allocate $[B, H, Q_t, \rho\kbudget]$ uniformly and pad non-triggered tiles' extra slots with the kernel's $\NB$-sentinel:
-\begin{equation}
-\text{kv\_idx}[t,h] \;=\;
-\begin{cases}
-\operatorname*{top-}{\rho k}\!\bigl(\text{tile\_score}[t,h,\cdot]\bigr) & \text{if }\text{trigger}[t]=1,\\[0.2em]
-\operatorname*{top-}{k}\!\bigl(\text{tile\_score}[t,h,\cdot]\bigr)\ \Vert\ [\,\NB,\dots,\NB\,] & \text{otherwise.}
-\end{cases}
-\end{equation}
-The kernel skips $b=\NB$ on a fast check, so non-triggered tiles cost the same as plain top-$k$. The end-to-end forward is otherwise unchanged: a standard FlashAttention-style online softmax, iterating each tile's $\text{kv\_idx}$ instead of all $\NB$ blocks.
+To preserve a fixed kernel dispatch shape across triggered and non-triggered tiles, we allocate $[B, H, Q_t, \rho\kbudget]$ uniformly: triggered tiles fill all $\rho\kbudget$ slots from the expanded top-$\rho k$, while non-triggered tiles keep their top-$k$ and pad the remaining slots with the kernel's $\NB$-sentinel (the exact fill rule is step (A.9) of Appendix~\ref{app:derivation}). The kernel skips $b=\NB$ on a fast check, so non-triggered tiles cost the same as plain top-$k$. The end-to-end forward is otherwise unchanged: a standard FlashAttention-style online softmax, iterating each tile's $\text{kv\_idx}$ instead of all $\NB$ blocks.
 
 \paragraph{Cost accounting.} The average kept blocks per row is $\kbudget(1 + q(\rho - 1))$. At $q = 0.4, \rho = 2$ this is $1.4\,\kbudget$. The measured wall-time cost is sub-proportional to this block-count factor: router/top-$k$ kernel-time ratio is $\approx 1.53$ at 32K and $\approx 1.47$ at 64K (Section~\ref{sec:pareto}).
 
@@ -212,8 +198,8 @@ The router code path and the fused selection-plus-kernel implementation run unch
     \item \emph{dense} -- FlashAttention~\citep{dao2022flashattention} via PyTorch SDPA, the ceiling.
     \item \emph{top-$k$} -- per-tile top-$k$ on the K-mean backbone (Eq.~\ref{eq:block-score}). SSA-style baseline; uses only Step~2.
     \item \emph{Quest} -- per-tile top-$k$ on the Quest K-max upper-bound backbone (Eq.~\ref{eq:quest-score}). Strong baseline on sharp-needle tasks.
-    \item \emph{router} -- Steps 2--6 on top of the K-mean backbone, $q = 0.40, \rho = 2$. Uncertainty-gated expansion only.
-    \item \emph{router-on-Quest} -- Steps 2--6 on top of the Quest K-max backbone, same $q, \rho$. Combines better scoring with budget allocation.
+    \item \emph{router} -- Steps 2--5 on top of the K-mean backbone, $q = 0.40, \rho = 2$. Uncertainty-gated expansion only.
+    \item \emph{router-on-Quest} -- Steps 2--5 on top of the Quest K-max backbone, same $q, \rho$. Combines better scoring with budget allocation.
 \end{itemize}
 All four sparse policies share the same kernel and selection code; they differ only in (a) which backbone scores blocks and (b) whether the router expansion is applied. Wall-time and quality numbers are therefore directly comparable across them.
 
@@ -316,7 +302,7 @@ model & ctx & router accuracy & wall vs.\ dense & verdict \\
 
 \emph{(ii) Sparse runs slower than dense at short context and faster at long context; the crossover is structural (Amdahl).} Attention's share of dense prefill grows with context while the rest-of-model floor is invariant. On Qwen2.5-7B-1M attention shares are $31\% / 45\% / 63\%$ at $32$K/$64$K/$128$K, and the router crosses dense between $32$K and $64$K. On Qwen3.6 the attention share is much smaller ($11\% / 19\% / 37\%$) because $30/40$ layers are linear-attention rather than softmax, so the crossover shifts right, between $64$K and $128$K. The Pareto win materialises on both architectures; the context at which it activates is set by the architecture's attention share.
 
-\subsection{Where the lift comes from: budget vs.\ selectivity}\label{sec:lbv1}
+\subsection{Where the lift comes from: budget vs.\ selectivity}\label{sec:ablation}
 
 The router at $q=0.40, \rho=2$ spends on average $92.4$ effective blocks per tile vs.\ $66$ for Quest at $\kbudget=33$ -- $\approx 1.4\times$ Quest's budget. Some of the router's lift over Quest could therefore come from spending the marginal budget \emph{selectively} (the design intent), or simply from spending \emph{more} budget on average. To separate the two we ran uniform Quest at a budget-matched control ($\kbudget=47$, eff.\ $94$) and at intermediate budgets on the same RULER NIAH-multikey examples used in Table~\ref{tab:ruler}, on three models.
 
@@ -356,22 +342,20 @@ Reading the three columns together: when uncertainty at the cutoff is rare (shar
     \item \textbf{Cross-architecture coverage.} The panel covers four models from three architecture classes (dense Qwen2.5, dense Mistral, hybrid+MoE Qwen3.6); broader coverage on additional families (Llama-3, MiniMax, Gemma) and additional standardised benchmarks (e.g.\ HELMET-RAG) would strengthen the cross-family claim.
     \item \textbf{Engineering improvements.} Several speed optimisations remain on the table (a fused MoE kernel on hybrid+MoE; block-selection fused into the attention kernel for $\ge 256$K; per-row scatter for the per-tile granularity above). All are engineering work, not method changes; we leave them to future iterations.
     \item \textbf{Hyperparameter sweeps incomplete.} The trigger fraction $q = 0.40$ and expansion factor $\rho = 2$ were selected on a RULER NIAH-multikey sweep at $n=30$ and used unchanged everywhere; we did not re-sweep per task or per architecture. The diagnostic in Appendix~\ref{app:bai:empirical} opens a complementary path: \emph{predicting} the Bayes-optimal $q^\star$ per task from the measurable noise scale rather than searching for it; this is not yet wired into the harness.
-    \item \textbf{What's bounded, what's owed.} Appendix~\ref{app:bai} proves a non-asymptotic regret bound for the $\sigma$-quantile router vs.\ the Bayes-optimal expansion rule under Gaussian noise on block scores (Proposition~\ref{prop:bai-bound}, $C(\tau) \le 2$). The bound is a \emph{top-$k$ identification} regret; converting it to an attention-output bound requires a softmax-sensitivity step that we sketch but do not prove (\S\ref{app:bai:owed}). Empirically the identification bound is $\sim 15\times$ looser than the observed router-vs-dense gap on RULER NIAH; the deferred composition is the largest source of slack.
+    \item \textbf{What's bounded, what's owed.} Appendix~\ref{app:bai} proves a finite-sample regret bound for the $\sigma$-quantile trigger vs.\ the best trigger rule of the same budget, under Gaussian noise on block scores (Proposition~\ref{prop:bai-bound}). The bound is exponentially tight when secondary score spacings dominate the noise scale, but degrades to a trivial cap in the noise-dominated regime -- which is where our measured diagnostics place Qwen-14B at 32K, so the closed-form certificate is currently weak precisely where we operate; the pending sharp path is a Monte-Carlo evaluation of the regret from the same score dump (\S\ref{app:bai:empirical}). The bound is also a \emph{top-$k$ identification} regret; converting it to an attention-output bound requires a softmax-sensitivity step that we sketch but do not prove (\S\ref{app:bai:owed}).
 \end{enumerate}
 
 %========================================================================
 \section*{Conclusion}
 %========================================================================
-{\color{red}
 We presented an uncertainty-gated value-of-information \emph{router} for block-sparse attention selectors: a per-tile cutoff-margin signal $\sigma$ triggers a $\rho\times$ expansion of the kept set on the bottom $q$-fraction of tiles per layer, independent of how block scores are computed and stackable with existing scoring backbones such as Quest.
 
-The router delivers measurable accuracy gains across the panel. Headline: on LongBench-v2 medium ($n=215$, ctx=$32$K) router-on-Quest paired recall reaches $0.75$ vs.\ top-$k$ $0.47$ -- $+28$\,pp over the SSA-style baseline (McNemar $p<0.01$). The lift reproduces on four models from three architecture classes. On Qwen2.5 (14B and 7B-1M) and Mistral-Nemo the K-max (Quest) backbone wins; the router lifts it by $+15$\,pp on Nemo ($p<0.001$), where Quest has paired headroom. On the QK-Norm hybrid + MoE Qwen3.6-35B-A3B the K-mean backbone wins instead: router-on-K-mean is the dominant policy, tracking accuracy $0.98 \to 0.92 \to 0.89$ across $32$K $\to 64$K $\to 128$K. The central composition claim -- the router lifts whichever backbone wins on a given model -- holds in every cell of the panel. At $128$K the router preserves $0.81$ and $0.89$ of dense accuracy on Qwen2.5-7B-1M and Qwen3.6 respectively, while running at $0.62\times$ and $0.80\times$ dense wall time.
+The router delivers measurable accuracy gains across the panel: on every model and benchmark tested, it lifts whichever scoring backbone wins on that model. Which backbone that is proves model-dependent -- QK-Norm (Qwen3.6) flips the winner from Quest's K-max to the SSA-style K-mean -- but the composition claim holds in every cell of the panel. The lift activates only when the selector budget binds relative to where the answer-relevant evidence lives: LongBench-v1, whose native prompts fit comfortably in the context window, shows no headroom and serves as the negative control. At $128$K the router preserves $0.81$ and $0.89$ of dense accuracy on Qwen2.5-7B-1M and Qwen3.6 respectively, while running at $0.62\times$ and $0.80\times$ dense wall time.
 
 Three natural extensions: third-architecture validation (Llama-3 / MiniMax / Gemma) and HELMET-RAG; a fused MoE kernel on hybrid+MoE to push Qwen3.6's $128$K speed ratio toward $0.5\times$ dense; and composing the BAI top-$k$ identification bound of Appendix~\ref{app:bai} with an attention-output sensitivity step.
 
 Code, results, and reproduction scripts:\\
 \url{https://github.com/ThomasRossi/uncertainty-gated-block-sparse-attention}.
-}
 
 \clearpage
 %========================================================================
@@ -502,7 +486,7 @@ We tested two natural alternatives to Eq.~\eqref{eq:trigger} and they both fail.
 
 \section{$\sigma$ as a best-arm-identification exploration index}\label{app:bai}
 
-The Method section introduces $\sigma$ as a value-of-information proxy and validates it empirically. This appendix gives the formal anchor: under a Gaussian noise model on the per-block relevance signal, $\sigma$ is a dimensionless exploration index in the sense of best-arm identification (BAI), and the $\sigma$-quantile router is $C(\tau)$-times optimal for the per-tile expansion decision relative to the Bayes-optimal rule, with explicit non-asymptotic constants and a measurable leading factor.
+The Method section introduces $\sigma$ as a value-of-information proxy and validates it empirically. This appendix gives the formal anchor: under a Gaussian noise model on the per-block relevance signal, $\sigma$ is a dimensionless exploration index in the sense of best-arm identification (BAI); expanding the kept set never increases the identification error, pointwise; and the $\sigma$-quantile router admits a finite-$T$ regret bound against the best trigger rule of the same budget, with explicit constants that are exponentially small when the score spacings outside the cutoff dominate the noise scale, and an honest trivial-cap fallback when they do not.
 
 \subsection{The BAI intuition that motivates $\sigma$}\label{app:bai:intuition}
 
@@ -520,94 +504,125 @@ The rest of this appendix turns this heuristic into a regret bound.
 
 For each Q-tile $t \in [T]$ (we suppress the head index throughout) and block $b \in [\NB]$,
 \begin{equation}\label{eq:bai-noise}
-    s_{t,b} \;=\; \mu_{t,b} + \eta_{t,b}, \qquad \eta_{t,b} \stackrel{\text{iid}}{\sim} \mathcal N(0, \tau^2),
+    s_{t,b} \;=\; \mu_{t,b} + \eta_{t,b}, \qquad \eta_{t,b} \stackrel{\text{iid}}{\sim} \mathcal N(0, \tau^2).
 \end{equation}
-with $\mu_t \in \mathbb R^{\NB}$ deterministic conditional on the tile. We assume a uniform top-$k$ gap $\mu_{t,(k-1)} - \mu_{t,(k)} \ge \Delta_{\min} > 0$, where $\mu_{t,(j)}$ denotes the $j$th order statistic. Let $\widehat S_m(s_t) = \{b : s_{t,b} \ge s_{t,(m)}\}$ be the empirical top-$m$ set under $s_t$.
-
-A \emph{policy} $\Pi_q$ chooses a subset $E \subseteq [T]$ with $|E|/T \to q$ to expand, outputs $\widehat S_{\rho k}(s_t)$ for $t \in E$ and $\widehat S_k(s_t)$ otherwise. The per-tile identification error is $\mathcal E_t(\widehat S) := \mathbb P(\widehat S \not\supseteq S^*(\mu_t) \mid s_t)$, where $S^*(\mu_t)$ is the true top-$k$. The per-tile \emph{expansion value} is
+We work in the compound-decision (empirical-Bayes) frame: the relevance vector $\mu_t \in \mathbb R^{\NB}$ is modelled as drawn from an improper flat prior, so that conditional on the observed scores, $\mu_t \mid s_t \sim \mathcal N(s_t, \tau^2 I)$. Sort the scores of tile $t$ in decreasing order, $s_{t,(0)} \ge s_{t,(1)} \ge \cdots$, and define
+\begin{equation}\label{eq:gaps}
+g_t := s_{t,(k-1)} - s_{t,(k)}, \qquad G_t := s_{t,(k-1)} - s_{t,(\rho k)}, \qquad r_t := s_{t,(0)} - s_{t,(k)}, \qquad \sigma_t := g_t / r_t.
+\end{equation}
+$g_t$ is the cutoff gap the router reads; $G_t \ge g_t$ is the \emph{expansion gap}, from the last kept rank down to the first rank excluded even after expansion. (An earlier draft used the local spacing $s_{t,(\rho k - 1)} - s_{t,(\rho k)}$ here; that is the wrong quantity -- the error event of the expanded set is governed by the cumulative gap $G_t$, see Lemma~\ref{lem:localisation}.) Let $\widehat S_m(s_t) := \{b : s_{t,b} \ge s_{t,(m-1)}\}$ be the empirical top-$m$ set and $S^*(\mu_t)$ the true top-$k$ set of $\mu_t$. The per-tile identification error of a kept set $\widehat S$ is $\mathcal E_t(\widehat S) := \mathbb P(\widehat S \not\supseteq S^*(\mu_t) \mid s_t)$, and the per-tile \emph{expansion value} is
 \begin{equation}\label{eq:Vstar}
-    V^*_t(s_t) \;:=\; \mathcal E_t(\widehat S_k(s_t)) - \mathcal E_t(\widehat S_{\rho k}(s_t)).
+    V^*_t \;:=\; \mathcal E_t(\widehat S_k(s_t)) - \mathcal E_t(\widehat S_{\rho k}(s_t)).
 \end{equation}
-The Bayes-optimal expansion policy under the budget constraint is $\Pi_q^* := \{t : V^*_t \ge V^*_{(q)}\}$ (Neyman--Pearson on $V^*$). The router we use is the $\sigma$-quantile policy $\Pi_q^\sigma := \{t : \sigma_t \le \sigma_{(q)}\}$.
+
+\begin{observation}[expansion never harms, pointwise]\label{obs:monotone}
+$\widehat S_k \subseteq \widehat S_{\rho k}$, so $\{\widehat S_{\rho k} \not\supseteq S^*\} \subseteq \{\widehat S_k \not\supseteq S^*\}$, hence $V^*_t \ge 0$ for every realisation of $s_t$. No distributional assumption is needed.
+\end{observation}
+
+A \emph{trigger policy} chooses $E \subseteq [T]$ with $|E| = \lceil qT \rceil$, keeps $\widehat S_{\rho k}(s_t)$ for $t \in E$ and $\widehat S_k(s_t)$ otherwise; its risk $\mathcal E(\Pi)$ is the average over tiles of the per-tile error of the kept set. The action space is deliberately restricted to $\{\text{empirical top-}k,\ \text{empirical top-}\rho k\}$: a fully Bayes-optimal agent could also re-select \emph{which} blocks to keep from the posterior, and we claim nothing about that larger class. Within the class, minimising $\mathcal E(\Pi)$ is equivalent to maximising $\sum_{t \in E} V^*_t$, so the optimal trigger is $\Pi_q^* :=$ the $\lceil qT \rceil$ tiles of largest $V^*_t$ (Neyman--Pearson on $V^*$). The router is the $\sigma$-quantile rule $\Pi_q^\sigma :=$ the $\lceil qT \rceil$ tiles of smallest $\sigma_t$. The regret is
+\begin{equation}\label{eq:regret-def}
+\mathcal R_q \;:=\; \mathcal E(\Pi_q^\sigma) - \mathcal E(\Pi_q^*) \;=\; \frac1T \Bigl[ \sum_{t \in \Pi_q^*} V^*_t \;-\; \sum_{t \in \Pi_q^\sigma} V^*_t \Bigr] \;\ge\; 0.
+\end{equation}
+
+Two structural assumptions, both with measurable proxies (\S\ref{app:bai:empirical}):
+\begin{itemize}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
+    \item[\textbf{(A1)}] \emph{Secondary-spacing floor.} Every spacing other than the cutoff spacing is at least $\Delta_2 \ge 0$: $s_{t,(j)} - s_{t,(j+1)} \ge \Delta_2$ for all $j \ne k-1$. (If a fraction $\pi_2$ of tiles violates the floor, those tiles cost at most the trivial per-tile cap, adding $\pi_2$ to the bound additively.)
+    \item[\textbf{(A2)}] \emph{Bounded spread variation.} $r_t = \bar r\,(1 + \xi_t)$ with $\bar r := \frac1T\sum_t r_t$ and $|\xi_t| \le \beta < 1$ for all $t$. The measured $\mathrm{CV}(r) := \sqrt{\mathrm{Var}_t\, r_t}/\bar r \le \beta$ is its observable proxy.
+\end{itemize}
 
 \subsection{Theorem and proof}\label{app:bai:theorem}
 
-\begin{proposition}[$\sigma$-quantile regret bound]\label{prop:bai-bound}
-Under model~\eqref{eq:bai-noise} with $\Delta_{\min} > 0$ and a bounded density of $g_t$ in a neighbourhood of its $q$-quantile $g_{(q)}$,
-\begin{equation}\label{eq:bai-suboptimality}
-\mathcal{E}(\Pi_q^\sigma) - \mathcal{E}(\Pi_q^*) \;\le\; 2\,\mathrm{CV}(r)\cdot q(1-q)\cdot \Phi\!\Bigl(-\tfrac{g_{(q)}}{\sqrt{2}\,\tau}\Bigr) \cdot \frac{r_q}{\tau} \;+\; O(T^{-1/2}),
+Throughout, $\Phi$ and $\phi$ are the standard normal CDF and density, and $\bar V(g) := \Phi\bigl(-g/(\sqrt2\,\tau)\bigr)$; $\bar V$ is decreasing with $\bar V(0) = \tfrac12$.
+
+\begin{lemma}[two-sided cutoff localisation]\label{lem:localisation}
+Let $\chi := \sum_{m \ge 1} (m+1)\, e^{-m^2 \Delta_2^2/(4\tau^2)}$; note $\chi \le 2.2\, e^{-\Delta_2^2/(4\tau^2)}$ once $\Delta_2 \ge 2\tau$. Under \eqref{eq:bai-noise} and (A1),
+\begin{align}
+\bar V(g_t) \;\le\; \mathcal E_t(\widehat S_k) \;&\le\; \bar V(g_t)\,(1 + \chi), \label{eq:loc-k}\\
+0 \;\le\; \mathcal E_t(\widehat S_{\rho k}) \;&\le\; \bar V(G_t)\,(1 + \chi), \label{eq:loc-rho}
+\end{align}
+and consequently, with $\bar\varepsilon := \chi + (1+\chi)\, \exp\bigl(-\bigl((\rho-1)k\,\Delta_2\bigr)^2/(4\tau^2)\bigr)$,
+\begin{equation}\label{eq:V-sandwich}
+(1 - \bar\varepsilon)\,\bar V(g_t) \;\le\; V^*_t \;\le\; (1 + \bar\varepsilon)\,\bar V(g_t).
 \end{equation}
-where $r_q$ is the $q$-quantile of $r_t$ across tiles and $\mathrm{CV}(r) := \sqrt{\mathrm{Var}_t r_t} / \mathbb{E}_t r_t$. For sub-Gaussian noise with variance proxy $\tau$ and true Gaussian variance $\sigma^2 \le \tau^2$, multiply the leading constant by $(1 + \kappa)$, $\kappa := (\tau/\sigma)^2 - 1$.
+\end{lemma}
+
+\begin{proof}
+\emph{Lower bound in \eqref{eq:loc-k}.} Let $b_{k-1}, b_k$ be the arms at empirical ranks $k{-}1$ and $k$. On the event $A := \{\mu_{b_k} > \mu_{b_{k-1}}\}$ the kept set fails: if $b_k \in S^*$ we are done, since $b_k \notin \widehat S_k$; otherwise at least $k$ arms exceed $\mu_{b_k}$, hence also $\mu_{b_{k-1}}$, so $b_{k-1} \notin S^*$ and the $k$ arms of $S^*$ cannot fit in the $k-1$ remaining slots of $\widehat S_k \setminus \{b_{k-1}\}$. Under the posterior the two means differ by $g_t$ with total variance $2\tau^2$, so $\mathbb P(A \mid s_t) = \Phi(-g_t/(\sqrt2\tau)) = \bar V(g_t)$.
+
+\emph{Upper bound in \eqref{eq:loc-k}.} If $\widehat S_k \not\supseteq S^*$, some $b' \notin \widehat S_k$ has $\mu_{b'}$ among the top $k$, so at most $k-1$ arms beat it in $\mu$; since $\widehat S_k$ has $k$ arms, some $b \in \widehat S_k$ has $\mu_b < \mu_{b'}$. Union-bound over pairs at empirical ranks $(i, j)$, $i \le k-1 < k \le j$. By (A1) the pair at distance $m := (k-1-i) + (j-k) \ge 0$ has score gap at least $g_t + m\Delta_2$, there are at most $m+1$ pairs at distance $m$, and the Gaussian tail ratio $\Phi(-x-a) \le \Phi(-x)\,e^{-ax - a^2/2}$ (valid for $a, x \ge 0$) gives $\Phi\bigl(-(g_t + m\Delta_2)/(\sqrt2\tau)\bigr) \le \bar V(g_t)\, e^{-m^2\Delta_2^2/(4\tau^2)}$. Summing over $m \ge 1$ and adding the cutoff pair ($m = 0$) yields $\bar V(g_t)(1+\chi)$.
+
+\emph{Upper bound in \eqref{eq:loc-rho}.} Same union bound with the excluded arm now outside the \emph{expanded} set: pairs $(i, j)$ with $i \le k-1$, $j \ge \rho k$. The dominant pair is $(k{-}1, \rho k)$ at gap $G_t$; every other pair is at gap $\ge G_t + m\Delta_2$ with $m := (k-1-i) + (j - \rho k)$. No matching lower bound is claimed at level $\rho k$, and none is needed.
+
+\emph{Sandwich \eqref{eq:V-sandwich}.} Upper: $V^*_t \le \mathcal E_t(\widehat S_k) \le (1+\chi)\bar V(g_t)$. Lower: $V^*_t \ge \bar V(g_t) - (1+\chi)\bar V(G_t)$; since $G_t - g_t \ge (\rho-1)k\,\Delta_2$ by (A1), the same tail ratio gives $\bar V(G_t) \le \bar V(g_t)\, e^{-((\rho-1)k\Delta_2)^2/(4\tau^2)}$.
+\end{proof}
+
+\begin{proposition}[$\sigma$-quantile regret, finite $T$]\label{prop:bai-bound}
+Let $\sigma_{(q)}$ be the largest $\sigma_t$ inside $\Pi_q^\sigma$ (the empirical quantile the router thresholds on) and $\gamma_q := \sigma_{(q)}\,\bar r$ its $g$-scale. Under \eqref{eq:bai-noise}, (A1) and (A2),
+\begin{equation}\label{eq:bai-suboptimality}
+\mathcal R_q \;\le\; \min(q,\, 1-q)\cdot C_q,
+\qquad
+C_q := \min\biggl\{\, 1,\;\; \frac{1+\bar\varepsilon}{2},\;\; \sqrt2\,\frac{\beta \gamma_q}{\tau}\; \phi\!\Bigl(\frac{\gamma_q(1-\beta)}{\sqrt2\,\tau}\Bigr) + \bar\varepsilon \,\biggr\}.
+\end{equation}
+The bound is exact at finite $T$: there is no asymptotic remainder, and every quantity is an empirical functional of the observed scores except the model parameters $(\tau, \Delta_2, \beta)$, which have measurable proxies (\S\ref{app:bai:empirical}).
 \end{proposition}
 
-The proof composes four steps. Each step is the closure of a hand-wave in the earlier sketch of this appendix.
-
-\paragraph{Step 1 -- cutoff-pair localisation.} Under flat prior, $\mu_t \mid s_t \sim \mathcal N(s_t, \tau^2 I)$. The event $\widehat S_k(s_t) \ne S^*(\mu_t)$ is a union of swap events between arms in and out of $\widehat S_k$; Bonferroni with Gaussian tail suppression gives
-\begin{equation}\label{eq:cutoff-loc}
-\mathcal E_t(\widehat S_k) \;=\; \Phi\!\Bigl(-\tfrac{g_t}{\sqrt 2 \tau}\Bigr)\,(1 + \delta_1), \qquad |\delta_1| \le (\NB - 2)\,\exp\!\Bigl(-\tfrac{(s_{(k)} - s_{(k+1)})\,g_t}{2\tau^2}\Bigr),
-\end{equation}
-since any pair $(b,b')$ other than the cutoff $(k{-}1,k)$ has $s_b - s_{b'} \ge s_{(k-1)} - s_{(k+1)} = g_t + (s_{(k)} - s_{(k+1)})$, and the Gaussian-tail ratio $\Phi(-x-a)/\Phi(-x) \le e^{-ax - a^2/2}$ suppresses it exponentially whenever the secondary gap is $\Omega(\tau)$. The top-$k$ gap assumption $\Delta_{\min} > 0$ ensures this in expectation. Applying the same at rank $\rho k$,
-\begin{equation}\label{eq:V-cutoff}
-    V^*_t(s_t) \;=\; \Phi\!\Bigl(-\tfrac{g_t}{\sqrt 2 \tau}\Bigr) - \Phi\!\Bigl(-\tfrac{g_t^{(\rho)}}{\sqrt 2 \tau}\Bigr) + O(\delta), \qquad g_t^{(\rho)} := s_{(\rho k - 1)} - s_{(\rho k)}.
-\end{equation}
-The single scalar $g_t$ is therefore a near-sufficient statistic for $V^*_t$ (modulo $g_t^{(\rho)}$, controlled next).
-
-\paragraph{Step 2 -- monotone spacings (expansion never harms in expectation).} The spacing density of the $j$th gap among $\NB$ iid Gaussians is monotone-increasing in $\min(j, \NB - j)$ \citep[Ch.~3]{david2003order}. Hence for $\rho k \le \NB / 2$, $\mathbb E[g_t^{(\rho)} \mid g_t] \ge g_t$ by stochastic ordering, so $V^*_t > 0$ in expectation and is monotone-decreasing in $g_t$. (The condition $\rho k \le \NB/2$ holds in all our experiments: with $\rho = 2$, $k = 33$, $\NB \in \{128, 256, 512\}$.)
-
-\paragraph{Step 3 -- $\sigma$ tracks $g$ up to spread variation.} Write $r_t = \bar r(1 + \xi_t)$ with $\bar r := \mathbb E_t r_t$, $\mathbb E\xi_t = 0$, $\mathrm{Var}\,\xi_t = \mathrm{CV}(r)^2$. Then
-\begin{equation}\label{eq:sigma-perturb}
-\sigma_t \;=\; \frac{g_t}{\bar r (1 + \xi_t)} \;=\; \frac{g_t}{\bar r}\bigl(1 - \xi_t + O(\xi_t^2)\bigr).
-\end{equation}
-
-\begin{lemma}[Rank perturbation]\label{lem:rank}
-The fraction of pairs $(t,t')$ ranked inconsistently by $g_t$ and $\sigma_t$ is at most $2\,\mathrm{CV}(r)$.
-\end{lemma}
-\emph{Proof.} A pair is swapped iff $g_t < g_{t'}$ but $g_t(1-\xi_t) > g_{t'}(1-\xi_{t'})$. Rearranging, $g_{t'} - g_t < g_{t'}\xi_{t'} - g_t\xi_t \le |\xi_{t'}|g_{t'} + |\xi_t|g_t$. Taking probabilities and applying Markov gives $\mathbb P(\text{swap}) \le 2\mathbb E|\xi_t| \le 2\sqrt{\mathbb E\xi_t^2} = 2\,\mathrm{CV}(r)$. \qed
-
-\paragraph{Step 4 -- regret from the boundary band.} Define the boundary band $\mathcal B_q := \{t : g_t \in [g_{(q)} \pm \delta]\}$. Outside $\mathcal B_q$ the $\sigma$-perturbation in \eqref{eq:sigma-perturb} is too small to cross the quantile boundary, so both rules agree. Choose $\delta = \mathrm{CV}(r)\cdot g_{(q)}$: under the assumed bounded density of $g_t$ near $g_{(q)}$, $|\mathcal B_q|/T = O(\mathrm{CV}(r))$. Each misclassification in $\mathcal B_q$ costs at most $|V^*_t - V^*_{(q)}|$, bounded by the mean-value theorem on \eqref{eq:V-cutoff}:
+\begin{proof}
+$|\Pi_q^*| = |\Pi_q^\sigma| = \lceil qT \rceil$, so the common tiles cancel in \eqref{eq:regret-def} and the two difference sets have equal cardinality $D \le \min(\lceil qT \rceil,\, T - \lceil qT \rceil)$. Pair them arbitrarily:
 \[
-|V^*_t - V^*_{(q)}| \;\le\; \phi\!\Bigl(-\tfrac{g_{(q)}}{\sqrt 2 \tau}\Bigr)\cdot \frac{\delta}{\sqrt 2 \tau}.
+\mathcal R_q \;=\; \frac1T \sum_{\text{pairs } (t, t')} \bigl( V^*_t - V^*_{t'} \bigr), \qquad t \in \Pi_q^* \setminus \Pi_q^\sigma,\quad t' \in \Pi_q^\sigma \setminus \Pi_q^*.
 \]
-Combining gives the leading term of \eqref{eq:bai-suboptimality}, with $g_{(q)} \le r_q$ absorbed into the $r_q/\tau$ factor and a numerical constant of $1/\sqrt{\pi}$ folded into the leading $2$. The $O(T^{-1/2})$ term comes from replacing the population $q$-quantile of $V^*$ by its empirical quantile across $T$ tiles, controlled by the Dvoretzky--Kiefer--Wolfowitz inequality \citep{dkw1956, massart1990}. \qed
+Only the $\sigma$-side constraints are needed. $t \notin \Pi_q^\sigma$ forces $\sigma_t \ge \sigma_{(q)}$, so by (A2) $g_t = \sigma_t r_t \ge \sigma_{(q)}\, \bar r\, (1-\beta) = \gamma_q(1-\beta)$; symmetrically, $t' \in \Pi_q^\sigma$ forces $g_{t'} \le \gamma_q(1+\beta)$. By the sandwich \eqref{eq:V-sandwich} and monotonicity of $\bar V$,
+\begin{align*}
+V^*_t - V^*_{t'} \;&\le\; (1+\bar\varepsilon)\,\bar V\bigl(\gamma_q(1-\beta)\bigr) - (1-\bar\varepsilon)\,\bar V\bigl(\gamma_q(1+\beta)\bigr) \\
+&=\; \underbrace{\bar V\bigl(\gamma_q(1-\beta)\bigr) - \bar V\bigl(\gamma_q(1+\beta)\bigr)}_{\text{boundary-band width in }\bar V}
+\;+\; \bar\varepsilon\, \underbrace{\bigl[\bar V(\gamma_q(1-\beta)) + \bar V(\gamma_q(1+\beta))\bigr]}_{\le\, 1}.
+\end{align*}
+The band-width term integrates the slope $\phi(\cdot/(\sqrt2\tau))/(\sqrt2\tau)$ over an interval of length $2\beta\gamma_q$, and $\phi$ is decreasing on the positive axis, giving at most $\sqrt2\, \beta\gamma_q\, \phi\bigl(\gamma_q(1-\beta)/(\sqrt2\tau)\bigr)/\tau$. The two caps come from $V^*_t \le \mathcal E_t(\widehat S_k) \le 1$ and $V^*_t \le (1+\bar\varepsilon)\bar V(g_t) \le \tfrac{1+\bar\varepsilon}{2}$, with $V^*_{t'} \ge 0$ (Observation~\ref{obs:monotone}). Multiplying the per-pair cost by $D/T \le \min(q, 1-q)$ completes the proof.
+\end{proof}
 
-\subsection{The constant $C(\tau) \le 2$}\label{app:bai:constant}
+\emph{Population-quantile version.} Thresholding on the distributional $q$-quantile of $\sigma$ instead of the empirical $\sigma_{(q)}$ adds the standard Dvoretzky--Kiefer--Wolfowitz fluctuation term $O(\sqrt{\log(1/\delta)/T})$ \citep{dkw1956, massart1990}; we state the empirical version because that is what the router computes.
 
-The Gaussian-noise bound $C(\tau) \le 2$ tracks the worst-case ratio of $r_t$ across tiles. Under \eqref{eq:bai-noise}, standard Gaussian extreme-value concentration gives $r_t \in [(\mu_{(0)} - \mu_{(k)}) \pm \tau\sqrt{2 \log \NB}]$ with probability $1 - O(\NB^{-1})$. Hence $\sup_t r_t / \inf_t r_t \to 1$ as $\Delta_{\min}/\tau \to \infty$, and is bounded by $3$ in the worst-case signal-noise-comparable regime $\mu_{(0)} - \mu_{(k)} \asymp \tau\sqrt{2 \log \NB}$. Anchoring the $\sigma$-rule's quantile boundary on the layer-conditional median of $r$ (rather than its extreme) yields the symmetric bound $C(\tau) \le 2$.
+\begin{remark}[band refinement: from $\min(q,1-q)$ to a measurable band mass]\label{rem:band}
+As $\bar\varepsilon \to 0$, $V^*_t$ becomes an exactly decreasing function of $g_t$, so $\Pi_q^*$ coincides with the bottom-$q$ rule on $g$. In that case every misrouted tile provably has $g_t \in [\gamma_q(1-\beta),\, \gamma_q(1+\beta)]$: tiles with $g_t$ below the band are triggered by both rules, tiles above it by neither (the argument uses only $r_t \in \bar r\,[1-\beta, 1+\beta]$ and the pigeonhole between the two thresholds). The mismatch fraction $D/T$ then improves from $\min(q, 1-q)$ to $\tfrac12 m_q(\beta)$, where $m_q(\beta)$ is the empirical fraction of tiles in the band -- directly measurable, and typically much smaller than $q$.
+\end{remark}
 
-For sub-Gaussian noise with proxy $\tau$ and true Gaussian variance $\sigma^2$, the extreme-value scale inflates to $\tau\sqrt{2\log \NB}\,(1 + \kappa)$ where $\kappa = (\tau/\sigma)^2 - 1$, hence $C(\tau) \le 2(1+\kappa)$. This is the precise content of the earlier ``linear in the sub-Gaussian variance proxy'' claim.
+\begin{remark}[regime of validity; the noise-dominated case]\label{rem:regime}
+The bound has two regimes. When secondary spacings dominate the noise, $\Delta_2 \gtrsim 2\tau\sqrt{\log(k\NB)}$, $\bar\varepsilon$ is exponentially small and the band term governs: the regret is the band mass around the boundary $\gamma_q$ times the local slope of $\Phi$. When the cutoff region is noise-dominated ($\Delta_2 \ll \tau$ -- the regime our diagnostics actually measure, \S\ref{app:bai:empirical}), $\bar\varepsilon$ is not small and \eqref{eq:bai-suboptimality} falls back to its trivial branch $\min(q, 1-q) \cdot \min\{1, \tfrac{1+\bar\varepsilon}{2}\}$: our localisation tools genuinely lose the link between $\sigma$ and $V^*$ there. Two things survive. First, Observation~\ref{obs:monotone} is assumption-free: expansion never harms, so the router can misallocate budget but cannot damage the kept set. Second, every quantity in \eqref{eq:regret-def} -- including $V^*_t$ and hence $\mathcal R_q$ itself -- is a posterior functional estimable by Monte Carlo from a score dump (sample $\mu \sim \mathcal N(s_t, \hat\tau^2 I)$, check containment); \S\ref{app:bai:empirical} adopts this as the evaluation path in the noise-dominated regime. Finally, for sub-Gaussian noise with variance proxy $\tau^2$ the \emph{upper} bounds of Lemma~\ref{lem:localisation} survive with $\Phi(-x)$ replaced by the proxy tail $e^{-x^2/2}$; the lower bound -- hence the sandwich -- additionally needs two-sided tail control, and we do not chase constants.
+\end{remark}
 
 \subsection{Empirical estimation of the bound}\label{app:bai:empirical}
 
-The bound \eqref{eq:bai-suboptimality} is non-asymptotic and every quantity on the right-hand side is measurable from a small diagnostic run. The recipe is:
+Every input to Proposition~\ref{prop:bai-bound} is measurable from a small diagnostic run. The recipe is:
 \begin{enumerate}[leftmargin=*,topsep=0.2em,itemsep=0.1em]
-    \item For each layer $\ell$ and head $h$, dump the per-tile block-score vector $(s_{t,b})_{b \in [\NB]}$ during prefill on a small example panel ($n=10$ is sufficient: a 32K context with $\BlockM = 64$ yields $\sim 512$ Q-tiles per (layer, head, example), so $\sim 5000$ tiles per (layer, head) overall -- ample for sample mean and variance of $r$).
-    \item Compute $r_t, g_t, \sigma_t, g_t^{(\rho)}$ from the sorted scores and aggregate $\mathrm{CV}(r)$, $r_q$, $g_{(q)}$ per layer.
-    \item Estimate $\tau$ as the residual standard deviation of $s_{t,b}$ against a smoothed reference -- the simplest being the across-tile median of $s_{\cdot, b}$ for each block $b$, on the heuristic that the true $\mu_{t,b}$ has slow tile-to-tile variation while $\eta_{t,b}$ is iid.
-    \item Plug into \eqref{eq:bai-suboptimality}. The bound becomes a per-layer numerical regret; aggregating by averaging or worst-casing across layers gives a single end-to-end number to compare against the empirical paired-recall gap (e.g.\ the $2$\,pp router-vs-dense gap on RULER NIAH n=100).
-    \item Cross-check Lemma 1 empirically: scatter $g_t^{(\rho)}$ against $g_t$; the conditional-mean line should lie above the diagonal.
+    \item For each layer $\ell$ and head $h$, dump the per-tile block-score vector $(s_{t,b})_{b \in [\NB]}$ during prefill on a small example panel ($n=10$ is sufficient: a 32K context with $\BlockM = 64$ yields $\sim 512$ Q-tiles per (layer, head, example), so $\sim 5000$ tiles per (layer, head) overall).
+    \item From the sorted scores compute $g_t, G_t, r_t, \sigma_t$; aggregate per layer $\mathrm{CV}(r)$ (the observable proxy for $\beta$), the boundary scale $\gamma_q = \sigma_{(q)} \bar r$, the band mass $m_q(\beta)$ of Remark~\ref{rem:band}, and the secondary-spacing quantiles that stand in for $\Delta_2$.
+    \item Estimate $\tau$ from the first-difference dispersion of per-row block scores along the query dimension (under $\mu_{t+1,b} \approx \mu_{t,b}$ for adjacent rows, $\mathbb E[(s_{t+1,b} - s_{t,b})^2] = 2\tau^2$). Caveat: this measures row-to-row score roughness -- a proxy for, not the same object as, the score-vs-relevance noise in \eqref{eq:bai-noise}; it is the simplest estimator consistent with the smoothness heuristic.
+    \item Evaluate \eqref{eq:bai-suboptimality}; and, independently of (A1)--(A2), estimate $\mathcal E_t(\widehat S_k)$, $\mathcal E_t(\widehat S_{\rho k})$, $V^*_t$ and $\mathcal R_q$ itself by Monte Carlo, sampling $\mu \sim \mathcal N(s_t, \hat\tau^2 I)$ and checking containment (Remark~\ref{rem:regime}). The MC estimate of $\mathcal R_q$ is the sharpest number this appendix can produce; the closed-form bound is its certificate in the spacing-dominated regime.
 \end{enumerate}
 
-\paragraph{Measured bound on Qwen-14B, RULER NIAH n=10, 32K.} The diagnostic collects $\sim$5.7M $(B, H, Q_t)$ tile cells per scoring backbone (10 examples $\times$ 48 layers $\times$ 40 heads $\times$ $\sim$512 tiles, masked to causally-valid tiles with $\ge \rho k + 1$ visible blocks) plus, per call, a $[B, H]$ noise-scale estimate $\hat\tau$ from the first-difference dispersion of per-row block scores along the query dimension (smoothness-residual estimator: under $\mu_{t+1,b} \approx \mu_{t,b}$ for adjacent rows of the prompt, $\mathbb E[(s_{t+1,b} - s_{t,b})^2] = 2\tau^2$). All quantities aggregated over the 48 Qwen-14B layers and 40 heads:
+\paragraph{Measured quantities on Qwen-14B, RULER NIAH n=10, 32K.} The diagnostic collects $\sim$5.7M $(B, H, Q_t)$ tile cells per scoring backbone (10 examples $\times$ 48 layers $\times$ 40 heads $\times$ $\sim$512 tiles, masked to causally-valid tiles with $\ge \rho k + 1$ visible blocks), plus the per-call noise-scale estimate $\hat\tau$ of step 3. Aggregated over the 48 Qwen-14B layers and 40 heads:
 
 \begin{center}
-\begin{tabular}{lcccccc}
+\begin{tabular}{lcccc}
 \toprule
-backbone & $\overline{\mathrm{CV}(r)}$ & $\overline{r_q}$ & $\langle g_t^{(\rho)} - g_t\rangle$ & $\hat\tau$ (median) & lead & bound$(\hat\tau)$ \\
+backbone & $\overline{\mathrm{CV}(r)}$ & $\overline{r_q}$ & $\hat\tau$ (median) & $g_q^+/\hat\tau$ \\
 \midrule
-mean (topk)       & $0.38$ & $4.06$ & $+4.8\!\times\!10^{-4}$ & $0.94$ & $0.74$ & $0.39$ \\
-Quest             & $0.32$ & $8.50$ & $+3.0\!\times\!10^{-3}$ & $2.25$ & $1.30$ & $0.28$ \\
-router-on-Quest   & $0.32$ & $8.63$ & $+2.8\!\times\!10^{-3}$ & $2.24$ & $1.31$ & $0.28$ \\
+mean (topk)       & $0.38$ & $4.06$ & $0.94$ & $\approx 0.03$ \\
+Quest             & $0.32$ & $8.50$ & $2.25$ & $\approx 0.03$ \\
+router-on-Quest   & $0.32$ & $8.63$ & $2.24$ & $\approx 0.03$ \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\noindent where $\mathrm{lead} := 2\,\mathrm{CV}(r)\,q(1{-}q)\,r_q$ is the $\tau$-free leading factor at $q=0.40$, and $\mathrm{bound}(\hat\tau) := \mathrm{lead} \cdot \Phi(-g_q^+/\sqrt 2\hat\tau)/\hat\tau$ with $g_q^+$ the $40$th-percentile of $g_t$ on the informative subset $\{t : g_t > 0\}$ (the $\mathtt{bf16}$ floor for Quest scores yields exact zeros on $\sim 83\%$ of tiles where the cutoff lands in the flat tail; conditioning on $g_t > 0$ is the honest active-set restriction). Three observations.
+\noindent where $r_q$ is the $q$-quantile of $r_t$ and $g_q^+$ is the $40$th percentile of $g_t$ on the informative subset $\{t : g_t > 0\}$ (the $\mathtt{bf16}$ floor for Quest scores yields exact zeros on $\sim 83\%$ of tiles, where the cutoff lands in the flat tail of the score distribution; conditioning on $g_t > 0$ is the honest active-set restriction). Four observations.
 
-\emph{(i) Lemma~1 holds empirically on every layer.} $\mathbb E[g_t^{(\rho)} - g_t] > 0$ for every $(\text{layer}, \text{backbone})$ cell ($48 \times 3 = 144$ cells, no exceptions) -- the expansion-helps-in-expectation guarantee survives the actual block-score distribution on a real transformer, not just iid Gaussian order statistics.
+\emph{(i) The measured regime is tie- and noise-dominated at the cutoff.} Even on the active set, $g_q^+/\hat\tau \approx 0.03$: the cutoff is buried in the noise, and the $83\%$ atom at $g_t = 0$ means the secondary-spacing floor (A1) holds only with $\Delta_2 \approx 0$. This places the diagnostic squarely in the noise-dominated regime of Remark~\ref{rem:regime}: $\bar\varepsilon$ is not small, and the closed-form certificate \eqref{eq:bai-suboptimality} falls back to its trivial branch ($\min(q, 1-q) = 40$\,pp at $q = 0.40$). The atom also means the band mass of Remark~\ref{rem:band} must be computed on the active set.
 
-\emph{(ii) Noise-dominated regime.} $g_q^+ / \hat\tau \approx 0.03$ for both backbones, so $\Phi(-g_q^+/\sqrt 2\hat\tau) \approx 0.49$ -- the cutoff is buried in the noise. Sensitivity at $\hat\tau/2$ and $2\hat\tau$ is flat: the bound varies within a factor of $\sim 2.7$ (Quest: $0.55, 0.28, 0.14$ at $\hat\tau/2, \hat\tau, 2\hat\tau$ respectively), because $\Phi$ saturates at $0.5$ and the $1/\hat\tau$ scaling dominates. This is the regime where the BAI bound has the least Bonferroni slack but also the smallest informational gap between the $\sigma$-rule and any other rule -- both are near-coin-flip on the contested boundary.
+\emph{(ii) The measured scales are consistent with a small true regret.} Within the two-$\Phi$ representation of Lemma~\ref{lem:localisation} -- heuristic here, since $\bar\varepsilon$ is uncontrolled in this regime -- the per-pair cost at the boundary is at most $\phi(0)\cdot(\text{boundary $g$-scale})/(\sqrt2\,\hat\tau) \approx 0.4 \times 0.03 / 1.41 \lesssim 1$\,pp. This is consistent with the observed $2$\,pp router-vs-dense paired gap on RULER NIAH $n=100$ (router-on-Quest $0.98$ vs.\ dense $1.00$), which itself upper-bounds the end-task manifestation of the regret: dense is the unconstrained policy, so $\mathcal E(\Pi_q^*) \ge \mathcal E(\text{dense}) = 0$.
 
-\emph{(iii) The bound is $\sim 15\times$ looser than the empirical gap, and we can name the looseness.} Empirical router-vs-dense identification gap on RULER NIAH $n=100$ is $\sim 2$\,pp (router-on-Quest $0.98$ vs.\ dense $1.00$); the bound predicts $\le 28$\,pp on the same backbone. The $\sim 15\times$ gap decomposes as: (a) Lemma~2's $2\,\mathrm{CV}(r)$ rank-swap fraction is a Markov-inequality upper bound, typically loose by $2$--$3\times$ for Gaussian-tail order statistics; (b) the leading factor sums regret over the full boundary band $|\mathcal B_q|/T = O(\mathrm{CV}(r))$, but actual swaps within $\mathcal B_q$ are sparser than the worst case; (c) identification error overstates attention-output error because most mis-identified blocks at the cutoff carry negligible softmax mass (the still-deferred Step in \S\ref{app:bai:owed}). The first two are tightenable inside this proof; the third is the natural follow-up theorem.
+\emph{(iii) Positivity of the expansion value is structural, not empirical.} An earlier draft validated that the local spacing at rank $\rho k$ exceeds $g_t$ in expectation, across all $48 \times 3$ (layer, backbone) cells, as an ``expansion helps in expectation'' check. Under the corrected definition \eqref{eq:gaps} no such check is needed: $G_t \ge g_t$ holds by construction, and $V^*_t \ge 0$ holds pointwise by Observation~\ref{obs:monotone}.
+
+\emph{(iv) Pending re-analysis.} The quantities the corrected bound actually consumes -- $\gamma_q$, the band mass $m_q(\beta)$, the secondary-spacing quantiles standing in for $\Delta_2$, and above all the Monte-Carlo estimate of $\mathcal R_q$ -- are computable from the same raw dump with an updated \texttt{analyze\_block\_scores.py} pass; no new GPU run is required. Until that pass lands, this section reports measured scales and regime identification, not a numerical certificate.
 
 Diagnostic produced by \texttt{dump\_block\_scores.py} (cache-safe runtime monkey-patch; lives outside \texttt{code\_version}) and \texttt{analyze\_block\_scores.py}. Raw pickle and per-layer table available with the release. Total diagnostic cost: $\sim$\$2 across the two $n{=}10$ runs.
 
@@ -617,11 +632,11 @@ The proposition controls top-$k$ \emph{identification} error -- the probability 
 \[
 \bigl\|\,o^{\widehat S} - o^{\mathrm{full}}\,\bigr\|_2 \;\le\; \Bigl(\sum_{b \notin \widehat S} \alpha^*_b\Bigr)\cdot \max_j \|v_j\|,
 \]
-where $\alpha^*$ is the dense softmax. The dropped softmax mass is itself $\Phi$-tailed in the cutoff gap -- the Step-1 argument applied at the softmax temperature $1/\sqrt d$ instead of $\tau$ -- so composing gives a bound proportional to $\Phi(-g_t / \tau_{\mathrm{softmax}})\cdot \max_j \|v_j\|$. The two temperatures are different constants and the composition is one paper of additional work; we record it as the natural follow-up theorem.
+where $\alpha^*$ is the dense softmax. The dropped softmax mass is itself $\Phi$-tailed in the cutoff gap -- the Lemma~\ref{lem:localisation} argument applied at the softmax temperature $1/\sqrt d$ instead of $\tau$ -- so composing gives a bound proportional to $\Phi(-g_t / \tau_{\mathrm{softmax}})\cdot \max_j \|v_j\|$. The two temperatures are different constants and the composition is one paper of additional work; we record it as the natural follow-up theorem.
 
-\textbf{Bought.} A non-asymptotic regret bound for the $\sigma$-quantile router, with explicit constants, a measurable leading factor $\mathrm{CV}(r)\cdot r_q/\tau$, and $C(\tau) \le 2$ under Gaussian noise.
+\textbf{Bought.} Pointwise ``expansion never harms'' with no distributional assumption (Observation~\ref{obs:monotone}); a two-sided localisation of the identification error to the cutoff and expansion gaps, with explicit constants (Lemma~\ref{lem:localisation}); and a finite-$T$, assumption-explicit regret bound for the $\sigma$-quantile trigger against the best trigger rule of the same budget, with a measurable band refinement (Proposition~\ref{prop:bai-bound}, Remarks~\ref{rem:band}--\ref{rem:regime}).
 
-\textbf{Owed.} The composite attention-output bound (one further composition with a softmax-sensitivity inequality); empirical $\mathrm{CV}(r)$ and $\tau$ per layer (a small diagnostic run, plan in \S\ref{app:bai:empirical}); and a treatment of LB-v2 medium that distinguishes ``the bound is loose'' from ``the budget is binding'' (budget sweep, Section~\ref{sec:limits}).
+\textbf{Owed.} The Monte-Carlo evaluation of $\mathcal R_q$ from the existing score dump (analysis-only, \S\ref{app:bai:empirical}); a sharper treatment of the noise-dominated regime than the trivial cap; the composite attention-output bound (one further composition with a softmax-sensitivity inequality); and a treatment of LB-v2 medium that distinguishes ``the bound is loose'' from ``the budget is binding'' (budget sweep, Section~\ref{sec:limits}).
 
 \bibliographystyle{plainnat}
 \begin{thebibliography}{99}
@@ -718,12 +733,7 @@ E.~Kaufmann, O.~Capp\'e, and A.~Garivier.
 \newblock On the complexity of best-arm identification in multi-armed bandit models.
 \newblock \emph{JMLR}, 17(1):1--42, 2016.
 
-% --- Order statistics and empirical-process tools (Appendix D)
-\bibitem[David and Nagaraja(2003)]{david2003order}
-H.~A. David and H.~N. Nagaraja.
-\newblock \emph{Order Statistics}.
-\newblock Wiley, 3rd edition, 2003.
-
+% --- Empirical-process tools (Appendix D)
 \bibitem[Dvoretzky et al.(1956)]{dkw1956}
 A.~Dvoretzky, J.~Kiefer, and J.~Wolfowitz.
 \newblock Asymptotic minimax character of the sample distribution function and of the classical multinomial estimator.
